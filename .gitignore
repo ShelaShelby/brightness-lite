@@ -1,0 +1,12 @@
+# Build output
+target/
+*.exe
+*.pdb
+
+# Local files
+settings.json
+*.log
+*.tmp
+.env
+.vscode/
+.idea/
