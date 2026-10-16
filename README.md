@@ -22,7 +22,10 @@ Get them from the latest release on the Releases page. `SHA256SUMS.txt` lets you
 - Saved values are put back at login, after the PC wakes up, and when a
   monitor is plugged in again, to the same physical monitor.
 - Tray menu: Open, Start with Windows / Start at login, Re-scan, Quit.
-- Windows only: monitors are numbered like Settings > System > Display, and
+- With two or more monitors, a small arrow button between two cards swaps
+  them. The order is saved and kept after a restart, a replug and a wake-up.
+  It only changes where the cards are shown.
+- On Windows, monitors are numbered like Settings > System > Display, and
   an Identify button shows the number on that monitor. Starts with Windows
   (on by default).
 

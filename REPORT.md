@@ -1,30 +1,39 @@
-# Brightness Lite 0.2.2 report
+# Brightness Lite 0.2.3 report
 
-## Bugs fixed
-- Key repeat on Ctrl+Alt+Up/Down queued one slow DDC write per press; a burst is now merged into one step (test added).
-- Windows: `GetMessageW` returns -1 on error, which counted as "true" and could spin the hotkey, events and Identify loops; now only >0 continues.
-- Settings saved from the window thread and the monitor thread shared one temp file; saves are now serialized.
-- Linux: no permission for /dev/i2c-N now shows a clear "not allowed to use /dev/i2c-N" line instead of a long list of guesses (test added).
-- Linux: hotplug socket is closed if it cannot be bound.
-- Checked, no change needed: handles/fds are released (Windows `Drop`, Linux opens per call), corrupt/missing settings load as defaults, autostart paths, sliders already write only on release.
+## New
+- Swap button (drawn arrows, no font glyphs) between neighbouring cards, shown with 2+ monitors.
+  The order is saved as monitor keys (`order` in settings.json) and applied on every scan, so it
+  holds after restart, replug and wake. Unknown monitors go at the end; an unplugged monitor keeps
+  its place. Cards stay bound to their real monitor (sliders, Identify, hotkeys unchanged).
+  Tests: order save/load, unknown monitors, unplug/replug. Checked by hand on Linux (Xvfb).
+- README and Cargo.toml say "Windows and Linux".
 
-## Lighter
-- Release profile: opt-level "z", full LTO, codegen-units 1, panic abort, strip.
-- Linux wake-up check timer 15 s -> 30 s (the only periodic wake-up; nothing wakes while the window is hidden).
-- No unused dependencies found (`cargo tree`: serde, serde_json, eframe, ksni, global-hotkey, libc; eframe already has default features off).
+## Memory (Windows): what was found and changed
+- Every window open started a new thread (300 ms uncloak safety net). Now one reusable timer
+  thread does this for all opens.
+- Checked, no per-open growth found: egui ids are stable (cards use `push_id(monitor index)`,
+  the swap button's id is its position), the drag map is cleared on open and holds at most
+  2 entries per monitor, repaints stop once the window is hidden, nothing is pushed to a Vec
+  or map per open.
+- 2 s after a hide (cancelled if the window is shown again) and once after the first hide at
+  startup, the working set is trimmed (`EmptyWorkingSet`). This only lowers the number Task
+  Manager shows; the pages come back when the window opens. It is not a leak fix.
+- NativeOptions now set depth, stencil and multisampling to 0 (they already were by default).
+  The unused monospace font (Hack) is no longer loaded; emoji fonts were already off.
 
-| Linux x86_64, Xvfb, software GL | 0.2.1 | 0.2.2 |
-| --- | --- | --- |
-| Binary size | 9.64 MB | 7.52 MB |
-| Idle CPU, 20 s (window hidden) | 0.10% | 0.10% |
-| Resident memory | 117.5 MB | 116.4 MB |
-
-RAM is dominated by the software GL driver in the test setup; real GPU numbers differ.
-
-## Releases
-- Files: `brightness-lite-windows-x64.exe`, `brightness-lite-linux-x64.tar.gz`, `SHA256SUMS.txt`.
-- `release.yml` runs on push to main (not for README/REPORT/LICENSE-only changes), by hand, and on `v*` tags; it creates the tag itself.
+## Cycle test numbers
+- `brightness-lite.exe --cycle-test N` (Windows only, not in the README) opens and hides the
+  window N times, 50 ms apart, and prints PrivateUsage and WorkingSetSize at 0, N/4, N/2, N
+  cycles and 3 s later (after the trim). Output also goes to `cycle-test.log`.
+- CI runs it on windows-latest with N=300 (step "Cycle test", continue-on-error) and puts the
+  numbers in the job summary. If the runner's own OpenGL cannot make the window, it retries
+  with Mesa's software OpenGL (llvmpipe).
+- Before/after numbers are not in this file: 0.2.2 has no cycle test, and this file was pushed
+  in the same single push that first ran the test. See the CI job summary of this commit.
+- A runner has no GPU: its numbers show growth in our code and egui, not in a real GPU driver,
+  where the reported per-open growth (~99 MB idle) may come from; that was not reproduced.
 
 ## Not verified
-- Windows idle CPU/RAM were not measured; Windows code was only checked with `cargo check --target x86_64-pc-windows-msvc` and CI.
-- No real monitor was available: DDC reads/writes are untested here.
+- No Windows machine: the timer, trim and cycle test were checked with
+  `cargo check`/`clippy --target x86_64-pc-windows-msvc` and CI only.
+- No real monitor: DDC reads/writes and the swap with real monitor keys are untested here.

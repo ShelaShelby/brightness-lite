@@ -39,6 +39,10 @@ pub struct Settings {
     /// The user's "Start with Windows" choice. None = never decided (first run: on).
     #[serde(default)]
     pub autostart: Option<bool>,
+    /// The order of the cards in the window, as monitor keys. Monitors not
+    /// listed go at the end. Keys of monitors not connected now are kept.
+    #[serde(default)]
+    pub order: Vec<String>,
 }
 
 impl Settings {
@@ -71,6 +75,20 @@ pub fn merged(old: &Settings, current: &[Current]) -> Settings {
             None => out.monitors.push(entry),
         }
     }
+    out
+}
+
+/// The new saved order after the connected monitors were put in the order
+/// `shown`. The slots that connected monitors held in `old` are refilled in
+/// the new order, so an unplugged monitor keeps its place for when it comes
+/// back. Connected monitors that were not in `old` go at the end.
+pub fn reordered(old: &[String], shown: &[String]) -> Vec<String> {
+    let mut next = shown.iter().filter(|k| old.contains(k));
+    let mut out: Vec<String> = old
+        .iter()
+        .map(|k| if shown.contains(k) { next.next().unwrap_or(k).clone() } else { k.clone() })
+        .collect();
+    out.extend(shown.iter().filter(|k| !old.contains(k)).cloned());
     out
 }
 
@@ -244,6 +262,36 @@ mod tests {
             merged(&old, &cur).find("b"),
             Some(&entry("b", DEFAULT_BRIGHTNESS, DEFAULT_CONTRAST))
         );
+    }
+
+    #[test]
+    fn order_roundtrip_and_kept_by_value_saves() {
+        let p = temp("order");
+        assert!(load(&p).order.is_empty());
+        let s = Settings { order: vec!["b".into(), "a".into()], ..Default::default() };
+        save(&p, &s).unwrap();
+        assert_eq!(load(&p).order, vec!["b", "a"]);
+        // Saving brightness/contrast keeps the order.
+        let kept = merged(&load(&p), &[Current { key: "a", brightness: Some(1), contrast: Some(2) }]);
+        assert_eq!(kept.order, vec!["b", "a"]);
+        // A file from before the order existed loads with an empty order.
+        std::fs::write(&p, "{\"monitors\": [], \"autostart\": true}").unwrap();
+        assert_eq!(load(&p).order, Vec::<String>::new());
+    }
+
+    fn keys(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn reordered_keeps_place_of_unplugged_and_appends_new() {
+        // Nothing saved yet: the shown order is taken as is.
+        assert_eq!(reordered(&[], &keys(&["b", "a"])), keys(&["b", "a"]));
+        // "a" is unplugged; b and c are swapped; "a" keeps the first place.
+        assert_eq!(reordered(&keys(&["a", "b", "c"]), &keys(&["c", "b"])), keys(&["a", "c", "b"]));
+        // A monitor never seen before goes at the end.
+        assert_eq!(reordered(&keys(&["a", "b"]), &keys(&["b", "a", "n"])), keys(&["b", "a", "n"]));
+        assert_eq!(reordered(&keys(&["a", "b"]), &keys(&["n", "b"])), keys(&["a", "b", "n"]));
     }
 
     #[cfg(not(windows))]

@@ -61,6 +61,16 @@ impl Cache {
     }
 }
 
+/// Indices into `views` in the order the cards are shown: monitors listed in
+/// `order` (saved keys) first, in that order; all others after them, in the
+/// order they were found.
+pub fn display_order(views: &[View], order: &[String]) -> Vec<usize> {
+    let rank = |v: &View| v.key.as_ref().and_then(|k| order.iter().position(|o| o == k)).unwrap_or(usize::MAX);
+    let mut idx: Vec<usize> = (0..views.len()).collect();
+    idx.sort_by_key(|&i| rank(&views[i])); // stable: unknown ones keep their found order
+    idx
+}
+
 /// Settings to write to disk, built from cached values alone (no monitor read).
 pub fn to_settings(views: &[View], old: &store::Settings) -> store::Settings {
     let current: Vec<store::Current> = views
@@ -105,6 +115,44 @@ mod tests {
         let saved = to_settings(&cache.views, &old);
         let m = saved.find("a").unwrap();
         assert_eq!((m.brightness, m.contrast), (30, 55));
+    }
+
+    fn keyed(key: Option<&str>) -> View {
+        View { key: key.map(Into::into), ..Default::default() }
+    }
+
+    fn keys(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn display_order_follows_saved_keys() {
+        let views = [keyed(Some("a")), keyed(Some("b")), keyed(Some("c"))];
+        assert_eq!(display_order(&views, &[]), vec![0, 1, 2]);
+        assert_eq!(display_order(&views, &keys(&["c", "a", "b"])), vec![2, 0, 1]);
+    }
+
+    #[test]
+    fn unknown_monitors_go_at_the_end() {
+        let views = [keyed(Some("new1")), keyed(None), keyed(Some("b")), keyed(Some("new2")), keyed(Some("a"))];
+        // Saved keys of monitors that are not connected ("gone") are skipped.
+        assert_eq!(display_order(&views, &keys(&["gone", "a", "b"])), vec![4, 2, 0, 1, 3]);
+    }
+
+    #[test]
+    fn order_survives_unplug_and_replug() {
+        let (a, b, c) = (keyed(Some("a")), keyed(Some("b")), keyed(Some("c")));
+        let mut order = keys(&["c", "a", "b"]);
+        // "a" unplugged: the others keep their relative order.
+        let two = [b.clone(), c.clone()];
+        assert_eq!(display_order(&two, &order), vec![1, 0]);
+        // The user swaps the two shown ones (now b above c) while "a" is away.
+        order = store::reordered(&order, &keys(&["b", "c"]));
+        assert_eq!(order, keys(&["b", "a", "c"]));
+        // "a" plugged back in (found in another position): it goes back to its place.
+        let three = [c, a, b];
+        let shown: Vec<_> = display_order(&three, &order).iter().map(|&i| three[i].key.clone().unwrap()).collect();
+        assert_eq!(shown, keys(&["b", "a", "c"]));
     }
 
     #[test]

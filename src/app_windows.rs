@@ -7,13 +7,14 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::ProcessStatus::{EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_DOWN, VK_LBUTTON,
@@ -51,6 +52,10 @@ static AWAIT_FRAME: AtomicBool = AtomicBool::new(false);
 static UNCLOAK_NOW: AtomicBool = AtomicBool::new(false);
 /// A tray click that follows a click-away hide must not reopen the window.
 const REOPEN_GUARD: Duration = Duration::from_millis(400);
+/// Safety net: a shown window is uncloaked after this long even without a painted frame.
+const UNCLOAK_AFTER: Duration = Duration::from_millis(300);
+/// After the window hides, give its memory back to Windows after this long.
+const TRIM_AFTER: Duration = Duration::from_secs(2);
 
 thread_local! {
     // Tray objects are not Send; the tray handlers run on this (main) thread.
@@ -70,6 +75,74 @@ fn repaint() {
     if let Some(c) = CTX.get() {
         c.request_repaint();
     }
+}
+
+// ---- one reusable timer thread (no thread per show) ----
+
+/// Things to do later. Set from any thread; done by the timer thread.
+struct Due {
+    uncloak: Option<Instant>,
+    trim: Option<Instant>,
+}
+
+static DUE: Mutex<Due> = Mutex::new(Due { uncloak: None, trim: None });
+static DUE_CHANGED: Condvar = Condvar::new();
+
+fn schedule(f: impl FnOnce(&mut Due)) {
+    let mut d = DUE.lock().unwrap_or_else(|e| e.into_inner());
+    f(&mut d);
+    DUE_CHANGED.notify_one();
+}
+
+fn start_timer() {
+    std::thread::spawn(|| loop {
+        // Never hold the lock during a Win32 call: the window thread may be
+        // waiting for it in schedule() while that call waits for the window thread.
+        let (uncloak, trim) = {
+            let mut d = DUE.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                let now = Instant::now();
+                let uncloak = d.uncloak.is_some_and(|t| t <= now);
+                let trim = d.trim.is_some_and(|t| t <= now);
+                if uncloak || trim {
+                    if uncloak {
+                        d.uncloak = None;
+                    }
+                    if trim {
+                        d.trim = None;
+                    }
+                    break (uncloak, trim);
+                }
+                d = match [d.uncloak, d.trim].into_iter().flatten().min() {
+                    Some(t) => DUE_CHANGED.wait_timeout(d, t - now).unwrap_or_else(|e| e.into_inner()).0,
+                    None => DUE_CHANGED.wait(d).unwrap_or_else(|e| e.into_inner()),
+                };
+            }
+        };
+        if uncloak {
+            cloak(false);
+        }
+        if trim && !window_visible() {
+            trim_working_set();
+        }
+    });
+}
+
+/// Let Windows take back the pages of a hidden window. This only lowers the
+/// number Task Manager shows (the working set); pages are read back in when
+/// the window is opened again. It frees no memory and fixes no leak.
+fn trim_working_set() {
+    unsafe {
+        let _ = EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
+/// (PrivateUsage, WorkingSetSize) in bytes.
+fn memory_info() -> Option<(usize, usize)> {
+    let mut c = PROCESS_MEMORY_COUNTERS_EX::default();
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+    unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut PROCESS_MEMORY_COUNTERS, size) }.ok()?;
+    Some((c.PrivateUsage, c.WorkingSetSize))
 }
 
 // ---- show / hide the window (plain Win32, works while egui is idle) ----
@@ -94,10 +167,10 @@ fn show_window() {
     // window is never on screen before its dark content is.
     cloak(true);
     AWAIT_FRAME.store(true, Ordering::Relaxed);
-    std::thread::spawn(|| {
-        // Safety net: never leave the window cloaked.
-        std::thread::sleep(Duration::from_millis(300));
-        cloak(false);
+    // Safety net: never leave the window cloaked. Shown again: no trim.
+    schedule(|d| {
+        d.uncloak = Some(Instant::now() + UNCLOAK_AFTER);
+        d.trim = None;
     });
     unsafe {
         let h = hwnd();
@@ -122,6 +195,7 @@ fn hide_window() {
     unsafe {
         let _ = ShowWindow(hwnd(), SW_HIDE);
     }
+    schedule(|d| d.trim = Some(Instant::now() + TRIM_AFTER));
 }
 
 fn window_visible() -> bool {
@@ -182,9 +256,7 @@ impl eframe::App for BrightnessApp {
         // First frame is done: hide the window again (eframe shows it after the
         // first paint) and from now on allow opening it.
         if !READY.load(Ordering::Relaxed) && FIRST_FRAME.load(Ordering::Relaxed) {
-            unsafe {
-                let _ = ShowWindow(hwnd(), SW_HIDE);
-            }
+            hide_window(); // also trims once, a moment later
             cloak(false);
             READY.store(true, Ordering::Relaxed);
         }
@@ -404,6 +476,73 @@ fn start_events(core: Shared) {
     });
 }
 
+// ---- --cycle-test N: open and hide the window N times, print the memory use ----
+
+fn cycle_test_arg() -> Option<u32> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|a| a == "--cycle-test")?;
+    args.get(i + 1).and_then(|n| n.parse().ok()).filter(|n| *n > 0)
+}
+
+/// Printed to stdout and appended to cycle-test.log in the current folder
+/// (this is a GUI program, so stdout may go nowhere).
+fn report(line: &str) {
+    use std::io::Write;
+    println!("{line}");
+    let _ = std::io::stdout().flush();
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("cycle-test.log") {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+fn report_memory(label: &str) {
+    match memory_info() {
+        Some((private, ws)) => report(&format!(
+            "{label:>10}  PrivateUsage {:8.2} MB  WorkingSetSize {:8.2} MB",
+            private as f64 / 1048576.0,
+            ws as f64 / 1048576.0
+        )),
+        None => report(&format!("{label:>10}  GetProcessMemoryInfo failed")),
+    }
+}
+
+/// Runs beside the window: waits until it can be opened, then opens and hides
+/// it `n` times about 50 ms apart, like a user clicking the tray icon.
+fn start_cycle_test(n: u32, core: Shared) {
+    std::thread::spawn(move || {
+        let t0 = Instant::now();
+        while !(READY.load(Ordering::Relaxed) && SCANNED.load(Ordering::Relaxed)) {
+            if t0.elapsed() > Duration::from_secs(60) {
+                report("cycle-test: the window was not ready after 60 s");
+                std::process::exit(2);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Let the startup trim (2 s after the first hide) happen first.
+        std::thread::sleep(TRIM_AFTER + Duration::from_secs(1));
+        report(&format!("cycle-test: {n} open/hide cycles"));
+        report_memory("cycle 0");
+        let marks = [n / 4, n / 2, n];
+        for c in 1..=n {
+            show_window();
+            std::thread::sleep(Duration::from_millis(50));
+            hide_window();
+            std::thread::sleep(Duration::from_millis(50));
+            if marks.contains(&c) {
+                report_memory(&format!("cycle {c}"));
+            }
+        }
+        std::thread::sleep(TRIM_AFTER + Duration::from_secs(1));
+        report_memory("+3 s idle");
+        let tx = lock(&core).sender();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        if tx.send(Cmd::Quit(done_tx)).is_ok() {
+            let _ = done_rx.recv_timeout(Duration::from_secs(3));
+        }
+        std::process::exit(0);
+    });
+}
+
 /// Take the named mutex. None means another copy already holds it.
 /// The returned handle must stay alive for as long as the app runs.
 fn single_instance(name: PCWSTR) -> Option<HANDLE> {
@@ -428,6 +567,8 @@ pub fn run() {
     // First guess for the height; the real height is measured on the first frames.
     let height = 150.0 + 165.0;
 
+    let cycle_test = cycle_test_arg();
+    // No depth, stencil or multisampling buffers: egui needs none of them.
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Brightness Lite")
@@ -438,6 +579,9 @@ pub fn run() {
             .with_always_on_top()
             .with_taskbar(false)
             .with_visible(false),
+        depth_buffer: 0,
+        stencil_buffer: 0,
+        multisampling: 0,
         ..Default::default()
     };
 
@@ -457,11 +601,19 @@ pub fn run() {
             create_tray(&core);
             start_hotkeys(core.clone());
             start_events(core.clone());
+            start_timer();
+            if let Some(n) = cycle_test {
+                start_cycle_test(n, core.clone());
+            }
             Ok(Box::new(BrightnessApp { core: core.clone(), ui: ui::UiState::default(), armed: false }))
         }),
     );
     if let Err(e) = result {
         eprintln!("window error: {e}");
+        if cycle_test.is_some() {
+            report(&format!("cycle-test: the window could not be created: {e}"));
+            std::process::exit(2);
+        }
     }
 }
 

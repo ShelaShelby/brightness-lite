@@ -39,7 +39,19 @@ impl UiState {
     }
 }
 
+/// Only the one font the window uses: the monospace font (Hack) is never shown,
+/// so it is not loaded.
+fn lean_fonts() -> egui::FontDefinitions {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.remove("Hack");
+    for list in fonts.families.values_mut() {
+        list.retain(|name| name != "Hack");
+    }
+    fonts
+}
+
 pub fn apply_theme(ctx: &egui::Context) {
+    ctx.set_fonts(lean_fonts());
     ctx.set_theme(egui::Theme::Dark);
     let mut v = egui::Visuals::dark();
     v.panel_fill = BG;
@@ -102,6 +114,32 @@ fn toggle(ui: &mut egui::Ui, on: &mut bool) -> egui::Response {
     resp
 }
 
+/// Small button with an up and a down arrow, drawn with the painter (no font glyphs).
+/// Its id depends only on its position, so it is the same from frame to frame.
+fn swap_button(ui: &mut egui::Ui, pos: usize, enabled: bool) -> egui::Response {
+    let size = Vec2::new(40.0, 18.0);
+    let (row, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), size.y), Sense::hover());
+    let rect = egui::Rect::from_center_size(row.center(), size);
+    let sense = if enabled { Sense::click() } else { Sense::hover() };
+    let resp = ui.interact(rect, ui.make_persistent_id(("swap", pos)), sense);
+    let resp = if enabled { resp.on_hover_text("Swap these two monitors") } else { resp };
+    let fill = if resp.hovered() && enabled { Color32::from_rgb(0x27, 0x2b, 0x33) } else { PANEL };
+    let color = if !enabled { RAIL } else if resp.hovered() { TEXT } else { MUTED };
+    let p = ui.painter();
+    p.rect(rect, RADIUS, fill, Stroke::new(1.0, BORDER), StrokeKind::Inside);
+    let stroke = Stroke::new(1.5, color);
+    let (cy, h, head) = (rect.center().y, 5.0, 3.0);
+    for (dx, up) in [(-5.0, true), (5.0, false)] {
+        let x = rect.center().x + dx;
+        let (tip, tail) = if up { (cy - h, cy + h) } else { (cy + h, cy - h) };
+        let back = if up { tip + head } else { tip - head };
+        p.line_segment([egui::pos2(x, tail), egui::pos2(x, tip)], stroke);
+        p.line_segment([egui::pos2(x - head, back), egui::pos2(x, tip)], stroke);
+        p.line_segment([egui::pos2(x + head, back), egui::pos2(x, tip)], stroke);
+    }
+    resp
+}
+
 fn setting_row(ui: &mut egui::Ui, core: &mut Core, st_ui: &mut UiState, i: usize, st: ddc::Setting) {
     let idx = i * 2 + st.index();
     let cur = core.cache.views[i].value(st);
@@ -141,8 +179,17 @@ pub fn draw(ui: &mut egui::Ui, core: &mut Core, st_ui: &mut UiState) {
     let ctx = ui.ctx().clone();
     let outer = Frame::new().fill(BG).inner_margin(Margin::same(MARGIN)).show(ui, |ui| {
         ui.set_width(WINDOW_W - 2.0 * MARGIN as f32);
-        for i in 0..core.cache.views.len() {
-            card(ui, |ui| {
+        let shown = core.display_order();
+        for (pos, &i) in shown.iter().enumerate() {
+            if pos > 0 {
+                // Between two neighbouring cards: swap them on screen.
+                let keyed = |j: usize| core.cache.views[j].key.is_some();
+                if swap_button(ui, pos, keyed(shown[pos - 1]) && keyed(i)).clicked() {
+                    core.swap(pos - 1);
+                }
+            }
+            // The id follows the monitor, not the position, so widget state stays with its card.
+            ui.push_id(("monitor", i), |ui| card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(core.cache.views[i].label()).size(15.0).strong());
                     #[cfg(windows)]
@@ -166,7 +213,7 @@ pub fn draw(ui: &mut egui::Ui, core: &mut Core, st_ui: &mut UiState) {
                 for st in ddc::Setting::ALL {
                     setting_row(ui, core, st_ui, i, st);
                 }
-            });
+            }));
         }
 
         card(ui, |ui| {
@@ -202,5 +249,20 @@ pub fn draw(ui: &mut egui::Ui, core: &mut Core, st_ui: &mut UiState) {
     if (h - st_ui.last_height).abs() > 0.5 {
         st_ui.last_height = h;
         ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(Vec2::new(WINDOW_W, h)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lean_fonts_keep_a_font_for_every_family() {
+        let f = lean_fonts();
+        assert!(!f.font_data.contains_key("Hack"));
+        for list in f.families.values() {
+            assert!(list.iter().any(|n| n == "Ubuntu-Light"));
+            assert!(list.iter().all(|n| f.font_data.contains_key(n)));
+        }
     }
 }

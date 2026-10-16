@@ -20,3 +20,23 @@ jobs:
         run: cargo test --locked
       - name: Release build
         run: cargo build --release --locked
+      # Memory check: open and hide the window 300 times and print PrivateUsage and
+      # WorkingSetSize at 0, 75, 150 and 300 cycles. Informational only.
+      - name: Cycle test (window open/hide x300, memory)
+        if: runner.os == 'Windows'
+        continue-on-error: true
+        timeout-minutes: 15
+        shell: bash
+        run: |
+          summary() { { echo "### Cycle test, $1"; echo '```'; cat "$2"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"; }
+          ./target/release/brightness-lite.exe --cycle-test 300 || echo "exit code $?"
+          touch cycle-test.log && cat cycle-test.log && summary "Windows OpenGL" cycle-test.log
+          # The runner has no GPU. If no window could be made, try Mesa's software OpenGL.
+          if ! grep -q "cycle 300" cycle-test.log; then
+            curl -sSfL -o mesa.7z https://github.com/pal1000/mesa-dist-win/releases/download/24.2.5/mesa3d-24.2.5-release-msvc.7z
+            mkdir -p mesa && 7z e -y -omesa mesa.7z 'x64/*.dll' > /dev/null
+            cp target/release/brightness-lite.exe mesa/
+            cd mesa
+            GALLIUM_DRIVER=llvmpipe ./brightness-lite.exe --cycle-test 300 || echo "exit code $?"
+            touch cycle-test.log && cat cycle-test.log && summary "Mesa llvmpipe (software OpenGL)" cycle-test.log
+          fi

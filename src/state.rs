@@ -62,6 +62,8 @@ pub struct Core {
     /// Set when the startup entry could not be changed.
     pub startup_error: String,
     pub startup: bool,
+    /// Saved order of the cards (monitor keys). Only changes where cards are shown.
+    pub order: Vec<String>,
     tx: Sender<Cmd>,
 }
 
@@ -73,10 +75,11 @@ pub fn start(notify: fn()) -> Arc<Mutex<Core>> {
     sync_autostart(settings_path.as_deref());
     let core = Arc::new(Mutex::new(Core {
         cache: Cache::default(),
-        settings_path,
+        settings_path: settings_path.clone(),
         hotkey_error: String::new(),
         startup_error: String::new(),
         startup: autostart::enabled(),
+        order: settings_path.as_deref().map(store::load).unwrap_or_default().order,
         tx: tx.clone(),
     }));
     let c = core.clone();
@@ -116,6 +119,28 @@ impl Core {
             v.set_value(setting, value);
         }
         self.send(Cmd::Write { generation: self.cache.generation, index, setting, value });
+    }
+
+    /// Indices into `cache.views`, in the order the cards are shown.
+    pub fn display_order(&self) -> Vec<usize> {
+        crate::cache::display_order(&self.cache.views, &self.order)
+    }
+
+    /// Swap the cards shown at `pos` and `pos + 1` and save the new order.
+    /// Only the position on screen changes; each card stays bound to its monitor.
+    pub fn swap(&mut self, pos: usize) {
+        let mut shown = self.display_order();
+        if pos + 1 >= shown.len() {
+            return;
+        }
+        shown.swap(pos, pos + 1);
+        let keys: Vec<String> = shown.iter().filter_map(|&i| self.cache.views[i].key.clone()).collect();
+        self.order = store::reordered(&self.order, &keys);
+        if let Some(p) = &self.settings_path {
+            let mut settings = store::load(p);
+            settings.order = self.order.clone();
+            let _ = store::save(p, &settings);
+        }
     }
 
     /// Turn the startup entry on or off. On failure the flag is unchanged
