@@ -76,6 +76,22 @@ fn read_edid_i2c(bus: u32) -> Option<Vec<u8>> {
     edid::parse(&buf).map(|_| buf)
 }
 
+/// True if /dev/i2c-N exists but this user may not open it.
+fn i2c_denied(bus: u32) -> bool {
+    matches!(open_bus(bus, ADDRESS), Err(e) if e.kind() == io::ErrorKind::PermissionDenied)
+}
+
+fn fail_message(label: &str, s: Setting, what: &str, bus: u32, denied: bool) -> String {
+    if denied {
+        format!("{label} {}: {what} failed. You are not allowed to use /dev/i2c-{bus}. Add a udev rule or join the i2c group (see the README).", s.name())
+    } else {
+        format!(
+            "{label} {}: {what} failed, no DDC/CI response. The monitor may be off or unplugged, or DDC/CI may be off in the monitor's menu.",
+            s.name()
+        )
+    }
+}
+
 /// State of one setting on one monitor.
 #[derive(Clone, Default)]
 pub struct Channel {
@@ -111,13 +127,7 @@ impl Monitor {
     }
 
     fn fail_text(&self, s: Setting, what: &str) -> String {
-        format!(
-            "{} {}: {} failed, no DDC/CI response. The monitor may be off or unplugged, DDC/CI may be off in the monitor's menu, or this user may not be allowed to use /dev/i2c-{} (see the README).",
-            self.label(),
-            s.name(),
-            what,
-            self.bus
-        )
+        fail_message(&self.label(), s, what, self.bus, i2c_denied(self.bus))
     }
 
     /// Set a value 0-100. Retries up to MAX_ATTEMPTS.
@@ -343,6 +353,14 @@ mod tests {
         assert_eq!(external_connector("renderD128"), None);
         assert_eq!(external_connector("version"), None);
         assert_eq!(external_connector("cardX-DP-1"), None);
+    }
+
+    #[test]
+    fn permission_failure_is_named() {
+        let m = fail_message("Monitor 1", Setting::Brightness, "write", 4, true);
+        assert!(m.contains("not allowed to use /dev/i2c-4"));
+        let m = fail_message("Monitor 1", Setting::Brightness, "write", 4, false);
+        assert!(m.contains("no DDC/CI response") && !m.contains("not allowed"));
     }
 
     #[test]

@@ -5,6 +5,15 @@ A very light brightness and contrast changer for your PC. Windows and Linux.
 It is a small tray app that sets the brightness and contrast of each
 external monitor over DDC/CI, and writes nothing else to the monitor.
 
+## Which file do I download?
+
+| Your computer | Download |
+| --- | --- |
+| Windows 10/11 (64-bit) | `brightness-lite-windows-x64.exe` |
+| Linux (64-bit) | `brightness-lite-linux-x64.tar.gz` |
+
+Get them from the latest release on the Releases page. `SHA256SUMS.txt` lets you check the download.
+
 ## What it does
 
 - One card per monitor with its model name, a Brightness and a Contrast slider.
@@ -24,7 +33,7 @@ external monitor over DDC/CI, and writes nothing else to the monitor.
 
 ## Linux notes
 
-Download `brightness-lite-linux-x86_64.tar.gz`, unpack it and run `./brightness-lite`.
+Download `brightness-lite-linux-x64.tar.gz`, unpack it and run `./brightness-lite`.
 
 - Monitors are reached through /dev/i2c-*. Once, as root:
 
@@ -47,8 +56,8 @@ Settings are kept in %APPDATA%\brightness-lite\settings.json on Windows and
 
     cargo build --release
 
-Run the tests with `cargo test`. A new release is built by GitHub when a tag
-like v0.2.0 is pushed.
+Run the tests with `cargo test`. GitHub builds a release by itself when a push to main
+has a new version in Cargo.toml.
 
 ## License
 

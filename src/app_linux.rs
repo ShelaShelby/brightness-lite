@@ -251,7 +251,7 @@ fn sleep_offset() -> Option<Duration> {
     Some(boot.saturating_sub(mono))
 }
 
-const TICK_MS: i32 = 15_000;
+const TICK_MS: i32 = 30_000;
 
 fn start_hotplug(core: Shared) {
     let tx = lock(&core).sender();
@@ -267,6 +267,9 @@ fn start_hotplug(core: Shared) {
                 libc::bind(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_nl>() as u32)
             };
             listening = r == 0;
+            if !listening {
+                unsafe { libc::close(fd) };
+            }
         }
         let mut last = sleep_offset();
         let mut buf = vec![0u8; 8192];

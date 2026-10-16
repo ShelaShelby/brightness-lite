@@ -230,6 +230,35 @@ impl Settle {
     }
 }
 
+/// Of several writes to the same slider only the last counts, and a run of
+/// hotkey presses (key repeat) becomes one step of the summed size.
+fn coalesce(batch: Vec<Cmd>) -> Vec<Cmd> {
+    let total: i32 = batch.iter().map(|c| if let Cmd::Hotkey(d) = c { *d } else { 0 }).sum();
+    let last_hotkey = batch.iter().rposition(|c| matches!(c, Cmd::Hotkey(_)));
+    let mut seen: Vec<(u64, usize, ddc::Setting)> = Vec::new();
+    let mut out = Vec::with_capacity(batch.len());
+    for (n, c) in batch.into_iter().enumerate().rev() {
+        match c {
+            Cmd::Write { generation, index, setting, .. } => {
+                let k = (generation, index, setting);
+                if seen.contains(&k) {
+                    continue;
+                }
+                seen.push(k);
+                out.push(c);
+            }
+            Cmd::Hotkey(_) => {
+                if Some(n) == last_hotkey {
+                    out.push(Cmd::Hotkey(total));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.reverse();
+    out
+}
+
 fn worker(core: Arc<Mutex<Core>>, rx: Receiver<Cmd>, notify: fn()) {
     let path = lock(&core).settings_path.clone();
     let mut monitors = ddc::Monitors::empty();
@@ -249,30 +278,16 @@ fn worker(core: Arc<Mutex<Core>>, rx: Receiver<Cmd>, notify: fn()) {
             },
         };
 
-        // Take everything that is waiting. Of several writes to the same slider only the last counts.
+        // Take everything that is waiting, then drop what a later command makes pointless.
         let mut batch: Vec<Cmd> = first.into_iter().collect();
         batch.extend(rx.try_iter());
-        let mut keep = vec![true; batch.len()];
-        let mut seen: Vec<(u64, usize, ddc::Setting)> = Vec::new();
-        for (n, c) in batch.iter().enumerate().rev() {
-            if let Cmd::Write { generation, index, setting, .. } = c {
-                let k = (*generation, *index, *setting);
-                if seen.contains(&k) {
-                    keep[n] = false;
-                } else {
-                    seen.push(k);
-                }
-            }
-        }
+        let batch = coalesce(batch);
 
         let mut failed = false;
         let mut save = false;
         let mut quit = None;
         let mut rescanned = false;
-        for (cmd, keep) in batch.into_iter().zip(keep) {
-            if !keep {
-                continue;
-            }
+        for cmd in batch {
             match cmd {
                 Cmd::Scan => {
                     monitors = scan(true, path.as_deref());
@@ -421,6 +436,18 @@ mod tests {
         assert_eq!(s.tries, 2);
         s.event(at(t0, 11));
         assert_eq!(s.tries, 0);
+    }
+
+    #[test]
+    fn coalesce_keeps_last_write_and_sums_hotkeys() {
+        let w = |g, index, value| Cmd::Write { generation: g, index, setting: ddc::Setting::Brightness, value };
+        let out = coalesce(vec![w(1, 0, 10), Cmd::Hotkey(5), w(1, 1, 20), w(1, 0, 30), Cmd::Hotkey(5), Cmd::Rescan, Cmd::Hotkey(-5)]);
+        assert_eq!(out.len(), 4);
+        assert!(matches!(out[0], Cmd::Write { index: 1, value: 20, .. }));
+        assert!(matches!(out[1], Cmd::Write { index: 0, value: 30, .. }));
+        assert!(matches!(out[2], Cmd::Rescan));
+        assert!(matches!(out[3], Cmd::Hotkey(5)));
+        assert!(coalesce(Vec::new()).is_empty());
     }
 
     fn v(key: &str, n: u32) -> View {

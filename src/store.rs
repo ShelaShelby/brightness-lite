@@ -116,6 +116,9 @@ pub fn load(path: &Path) -> Settings {
 /// Write to a temp file, then rename over the real one, so a crash or power
 /// cut in the middle can never leave a half-written settings file.
 pub fn save(path: &Path, settings: &Settings) -> std::io::Result<()> {
+    // The window thread and the monitor thread both save; one temp file, one writer at a time.
+    static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = SAVING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }

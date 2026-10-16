@@ -1,36 +1,66 @@
 name: Release
 
-# Runs when a version tag such as v0.2.0 is pushed. Builds both apps and
-# attaches them to a new GitHub release.
+# Runs on every push to main and by hand. If the tag v<version> from Cargo.toml
+# does not exist yet, builds both apps and creates the tag and the release.
+# Pushing a v* tag still works too.
 on:
   push:
+    branches: [main]
     tags: ["v*"]
+    paths-ignore: ["README.md", "REPORT.md", "LICENSE"]
+  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
+  check:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      exists: ${{ steps.v.outputs.exists }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml (v$version)"; exit 1
+          fi
+          # A release already exists, or the tag does (and this is not that tag's own push): stop.
+          if gh release view "v$version" >/dev/null 2>&1 ||
+             { [ "$GITHUB_REF_TYPE" != "tag" ] && git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; }; then
+            echo "v$version already exists, nothing to do"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
   windows:
+    needs: check
+    if: needs.check.outputs.exists == 'false'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Tag must match the version in Cargo.toml
-        shell: bash
-        run: |
-          want="v$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)"
-          if [ "$want" != "$GITHUB_REF_NAME" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml ($want)"; exit 1
-          fi
       - run: cargo test --locked
       - run: cargo build --release --locked
+      - name: Name the file
+        shell: bash
+        run: cp target/release/brightness-lite.exe brightness-lite-windows-x64.exe
       - uses: actions/upload-artifact@v4
         with:
           name: windows
-          path: target/release/brightness-lite.exe
+          path: brightness-lite-windows-x64.exe
 
   linux:
+    needs: check
+    if: needs.check.outputs.exists == 'false'
     # An older Ubuntu, so the program also runs on older distributions.
     runs-on: ubuntu-22.04
     steps:
@@ -43,14 +73,14 @@ jobs:
         run: |
           mkdir out
           cp target/release/brightness-lite out/brightness-lite
-          tar -C out -czf brightness-lite-linux-x86_64.tar.gz brightness-lite
+          tar -C out -czf brightness-lite-linux-x64.tar.gz brightness-lite
       - uses: actions/upload-artifact@v4
         with:
           name: linux
-          path: brightness-lite-linux-x86_64.tar.gz
+          path: brightness-lite-linux-x64.tar.gz
 
   publish:
-    needs: [windows, linux]
+    needs: [check, windows, linux]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/download-artifact@v4
@@ -60,13 +90,26 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum brightness-lite.exe brightness-lite-linux-x86_64.tar.gz > SHA256SUMS.txt
+          sha256sum brightness-lite-windows-x64.exe brightness-lite-linux-x64.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
-      - name: Create the release
+      - name: Create the tag and the release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.check.outputs.version }}
+          SHA: ${{ github.sha }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/* \
-            --title "Brightness Lite ${GITHUB_REF_NAME#v}" \
+          cat > notes.md <<'NOTES'
+          | Your computer | Download |
+          | --- | --- |
+          | Windows 10/11 (64-bit) | download `brightness-lite-windows-x64.exe` |
+          | Linux (64-bit) | download `brightness-lite-linux-x64.tar.gz` |
+
+          `SHA256SUMS.txt` has the checksums of both files.
+
+          NOTES
+          gh release create "v$VERSION" dist/* \
+            --target "$SHA" \
+            --title "Brightness Lite $VERSION" \
+            --notes-file notes.md \
             --generate-notes

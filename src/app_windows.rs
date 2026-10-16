@@ -338,7 +338,7 @@ fn start_hotkeys(core: Shared) {
             lock(&core).hotkey_error = "Hotkeys Ctrl+Alt+Up/Down are already used by another program.".into();
         }
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             if msg.message == WM_HOTKEY {
                 match msg.wParam.0 as i32 {
                     HOTKEY_UP => lock(&core).send(Cmd::Hotkey(ddc::STEP)),
@@ -397,7 +397,7 @@ fn start_events(core: Shared) {
             return;
         }
         let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+        while GetMessageW(&mut msg, None, 0, 0).0 > 0 {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
