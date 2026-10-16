@@ -1,0 +1,72 @@
+name: Release
+
+# Runs when a version tag such as v0.2.0 is pushed. Builds both apps and
+# attaches them to a new GitHub release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tag must match the version in Cargo.toml
+        shell: bash
+        run: |
+          want="v$(grep -m1 '^version' Cargo.toml | cut -d '"' -f2)"
+          if [ "$want" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml ($want)"; exit 1
+          fi
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: target/release/brightness-lite.exe
+
+  linux:
+    # An older Ubuntu, so the program also runs on older distributions.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - name: Pack
+        run: |
+          mkdir out
+          cp target/release/brightness-lite out/brightness-lite
+          tar -C out -czf brightness-lite-linux-x86_64.tar.gz brightness-lite
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: brightness-lite-linux-x86_64.tar.gz
+
+  publish:
+    needs: [windows, linux]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum brightness-lite.exe brightness-lite-linux-x86_64.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "Brightness Lite ${GITHUB_REF_NAME#v}" \
+            --generate-notes

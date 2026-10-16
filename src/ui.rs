@@ -8,6 +8,8 @@ use eframe::egui::{
 use std::collections::HashMap;
 
 pub const WINDOW_W: f32 = 360.0;
+/// Text of the startup switch (tray menu and window).
+pub const STARTUP_LABEL: &str = if cfg!(windows) { "Start with Windows" } else { "Start at login" };
 pub const BG: Color32 = Color32::from_rgb(0x16, 0x18, 0x1c);
 const PANEL: Color32 = Color32::from_rgb(0x1f, 0x22, 0x28);
 const BORDER: Color32 = Color32::from_rgb(0x2c, 0x30, 0x38);
@@ -143,6 +145,7 @@ pub fn draw(ui: &mut egui::Ui, core: &mut Core, st_ui: &mut UiState) {
             card(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(core.cache.views[i].label()).size(15.0).strong());
+                    #[cfg(windows)]
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let m = &core.cache.views[i];
                         let target = m.display_number.zip(m.rect);
@@ -157,6 +160,9 @@ pub fn draw(ui: &mut egui::Ui, core: &mut Core, st_ui: &mut UiState) {
                         }
                     });
                 });
+                if let Some(name) = core.cache.views[i].name.clone() {
+                    ui.add(egui::Label::new(RichText::new(name).color(MUTED).size(12.0)).truncate());
+                }
                 for st in ddc::Setting::ALL {
                     setting_row(ui, core, st_ui, i, st);
                 }
@@ -165,7 +171,7 @@ pub fn draw(ui: &mut egui::Ui, core: &mut Core, st_ui: &mut UiState) {
 
         card(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label("Start with Windows");
+                ui.label(STARTUP_LABEL);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let mut on = core.startup;
                     if toggle(ui, &mut on).changed() {

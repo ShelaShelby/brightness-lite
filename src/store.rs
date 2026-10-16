@@ -82,9 +82,27 @@ pub fn startup_command(exe: &Path) -> String {
     format!("\"{}\" {}", exe.display(), AUTOSTART_ARG)
 }
 
-/// %APPDATA%\brightness-lite\settings.json
+/// Windows: %APPDATA%\brightness-lite\settings.json
+/// Linux: $XDG_CONFIG_HOME (or ~/.config)/brightness-lite/settings.json
 pub fn default_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(DIR_NAME).join(FILE_NAME))
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join(DIR_NAME).join(FILE_NAME))
+    }
+    #[cfg(not(windows))]
+    {
+        config_base(std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"))
+            .map(|b| b.join(DIR_NAME).join(FILE_NAME))
+    }
+}
+
+/// The per-user config folder on Linux. A relative XDG_CONFIG_HOME is ignored, as the spec says.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn config_base(xdg: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    let xdg = xdg.map(PathBuf::from).filter(|p| p.is_absolute());
+    xdg.or_else(|| {
+        home.map(PathBuf::from).filter(|p| p.is_absolute()).map(|h| h.join(".config"))
+    })
 }
 
 /// Missing or corrupt file gives defaults. Never panics.
@@ -223,6 +241,19 @@ mod tests {
             merged(&old, &cur).find("b"),
             Some(&entry("b", DEFAULT_BRIGHTNESS, DEFAULT_CONTRAST))
         );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn config_base_follows_the_xdg_rules() {
+        use std::ffi::OsString;
+        let o = |s: &str| Some(OsString::from(s));
+        assert_eq!(config_base(o("/x/cfg"), o("/home/a")), Some(PathBuf::from("/x/cfg")));
+        assert_eq!(config_base(None, o("/home/a")), Some(PathBuf::from("/home/a/.config")));
+        assert_eq!(config_base(o("relative"), o("/home/a")), Some(PathBuf::from("/home/a/.config")));
+        assert_eq!(config_base(o(""), o("/home/a")), Some(PathBuf::from("/home/a/.config")));
+        assert_eq!(config_base(None, None), None);
+        assert_eq!(config_base(None, o("rel")), None);
     }
 
     #[test]

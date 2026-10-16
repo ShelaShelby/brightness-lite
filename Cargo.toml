@@ -1,19 +1,25 @@
 [package]
 name = "brightness-lite"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Windows tray app for external monitor brightness and contrast over DDC/CI"
+description = "Tray app for external monitor brightness and contrast over DDC/CI (Windows and Linux)"
 license = "MIT"
 repository = "https://github.com/ShelaShelby/brightness-lite"
 
 [dependencies]
-serde = { version = "=1.0.210", features = ["derive"] }
-serde_json = "=1.0.128"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
 
 [target.'cfg(windows)'.dependencies]
 eframe = { version = "=0.37.0", default-features = false, features = ["default_fonts", "glow"] }
 tray-icon = { version = "=0.26.1", default-features = false }
 raw-window-handle = "=0.6.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "=0.37.0", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+ksni = { version = "=0.3.6", default-features = false, features = ["async-io", "blocking"] }
+global-hotkey = { version = "=0.8.0", default-features = false }
+libc = "=0.2.190"
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "=0.58.0"

@@ -8,8 +8,10 @@ type Rect = (i32, i32, i32, i32);
 /// One monitor as the window sees it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct View {
-    /// Windows display number, if known.
+    /// Display number ("Monitor 2"), if known.
     pub display_number: Option<u32>,
+    /// Model name from the monitor's EDID, if known.
+    pub name: Option<String>,
     /// Stable id of the physical monitor, if known.
     pub key: Option<String>,
     /// Position on the desktop, if known.
@@ -39,14 +41,17 @@ pub struct Cache {
     pub views: Vec<View>,
     /// False until the first scan has finished.
     pub scanned: bool,
-    /// Counts scans, so a write meant for an old monitor list can be dropped.
+    /// Counts changes of the monitor list, so a write meant for an old list can be dropped.
     pub generation: u64,
+    /// Hints from the last scan (why nothing was found, and so on).
+    pub notes: Vec<String>,
 }
 
 impl Cache {
-    pub fn replace(&mut self, views: Vec<View>, generation: u64) {
+    pub fn replace(&mut self, views: Vec<View>, generation: u64, notes: Vec<String>) {
         self.views = views;
         self.generation = generation;
+        self.notes = notes;
         self.scanned = true;
     }
 
@@ -82,7 +87,7 @@ mod tests {
     #[test]
     fn cache_returns_last_values_without_a_monitor_read() {
         let mut cache = Cache::default();
-        cache.replace(vec![view("a", Some(40), Some(60))], 1);
+        cache.replace(vec![view("a", Some(40), Some(60))], 1, Vec::new());
         // A slider moved: the cache takes the new value straight away.
         cache.views[0].set_value(Setting::Brightness, 75);
         assert_eq!(cache.views[0].value(Setting::Brightness), Some(75));
@@ -96,7 +101,7 @@ mod tests {
     #[test]
     fn unreadable_value_keeps_old_saved_number() {
         let old = store::Settings { monitors: vec![store::SavedMonitor { key: "a".into(), brightness: 30, contrast: 20 }], ..Default::default() };
-        let cache = Cache { views: vec![view("a", None, Some(55))], scanned: true, generation: 1 };
+        let cache = Cache { views: vec![view("a", None, Some(55))], scanned: true, generation: 1, ..Default::default() };
         let saved = to_settings(&cache.views, &old);
         let m = saved.find("a").unwrap();
         assert_eq!((m.brightness, m.contrast), (30, 55));
