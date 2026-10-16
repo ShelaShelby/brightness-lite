@@ -1,6 +1,6 @@
 [package]
 name = "brightness-lite"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Tray app for external monitor brightness and contrast over DDC/CI (Windows and Linux)"
 license = "MIT"

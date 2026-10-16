@@ -14,10 +14,11 @@ mod windows_impl {
     use crate::store;
     use std::path::Path;
     use windows::core::{w, PCWSTR};
-    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
-        HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ,
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
+        RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
+        REG_OPTION_NON_VOLATILE, REG_SZ,
     };
 
     const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -65,9 +66,28 @@ mod windows_impl {
         let name = wide(name);
         unsafe {
             let mut key = HKEY::default();
-            RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, &mut key)
+            if command.is_some() {
+                // The Run key may not exist yet (fresh profiles): create it.
+                RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    RUN_KEY,
+                    0,
+                    PCWSTR::null(),
+                    REG_OPTION_NON_VOLATILE,
+                    KEY_SET_VALUE,
+                    None,
+                    &mut key,
+                    None,
+                )
                 .ok()
                 .map_err(|e| e.to_string())?;
+            } else {
+                let r = RegOpenKeyExW(HKEY_CURRENT_USER, RUN_KEY, 0, KEY_SET_VALUE, &mut key);
+                if r == ERROR_FILE_NOT_FOUND || r == ERROR_PATH_NOT_FOUND {
+                    return Ok(()); // no key, so nothing to remove
+                }
+                r.ok().map_err(|e| e.to_string())?;
+            }
             let res = match command {
                 Some(c) => {
                     let cmd = wide(c);
