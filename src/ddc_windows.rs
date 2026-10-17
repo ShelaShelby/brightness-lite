@@ -2,13 +2,13 @@
 
 use super::*;
 use std::time::Duration;
+use windows::core::PCWSTR;
 use windows::Win32::Devices::Display::{
-    DestroyPhysicalMonitors, GetMonitorBrightness, GetMonitorContrast,
-    GetNumberOfPhysicalMonitorsFromHMONITOR, GetPhysicalMonitorsFromHMONITOR,
-    SetMonitorBrightness, SetMonitorContrast, PHYSICAL_MONITOR,
+    DestroyPhysicalMonitors, GetMonitorBrightness, GetMonitorCapabilities, GetMonitorContrast,
+    GetNumberOfPhysicalMonitorsFromHMONITOR, GetPhysicalMonitorsFromHMONITOR, SetMonitorBrightness, SetMonitorContrast,
+    PHYSICAL_MONITOR,
 };
 use windows::Win32::Foundation::{BOOL, HANDLE, LPARAM, RECT, TRUE};
-use windows::core::PCWSTR;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE,
 };
@@ -16,9 +16,12 @@ use windows::Win32::System::Registry::{
 /// Ask EnumDisplayDevices for the monitor's device interface path.
 const EDD_GET_DEVICE_INTERFACE_NAME: u32 = 1;
 use windows::Win32::Graphics::Gdi::{
-    EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, DISPLAY_DEVICEW,
-    HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
+    EnumDisplayDevicesW, EnumDisplayMonitors, GetMonitorInfoW, DISPLAY_DEVICEW, HDC, HMONITOR, MONITORINFO,
+    MONITORINFOEXW,
 };
+
+/// Left, top, right, bottom in desktop pixels.
+type Rect = (i32, i32, i32, i32);
 
 /// State of one setting on one monitor.
 #[derive(Clone, Default)]
@@ -29,6 +32,8 @@ pub struct Channel {
     pub percent: Option<u32>,
     /// Set when DDC/CI did not answer after all attempts.
     pub error: Option<String>,
+    /// The monitor's capabilities say it does not have this setting.
+    pub unsupported: bool,
 }
 
 pub struct Monitor {
@@ -39,7 +44,7 @@ pub struct Monitor {
     /// Model name from the monitor's EDID, if Windows has it.
     pub name: Option<String>,
     /// Position on the virtual desktop (left, top, right, bottom), if known.
-    pub rect: Option<(i32, i32, i32, i32)>,
+    pub rect: Option<Rect>,
     raw: PHYSICAL_MONITOR,
     channels: [Channel; 2],
 }
@@ -72,8 +77,14 @@ impl Monitor {
     }
 
     /// Error messages for every setting that failed on this monitor.
-    pub fn errors(&self) -> Vec<String> {
-        self.channels.iter().filter_map(|c| c.error.clone()).collect()
+    /// The error of one setting, if it failed.
+    pub fn error(&self, s: Setting) -> Option<String> {
+        self.channels[s.index()].error.clone()
+    }
+
+    /// False if the monitor said it does not have this setting.
+    pub fn supported(&self, s: Setting) -> bool {
+        !self.channels[s.index()].unsupported
     }
 
     fn fail_text(&self, s: Setting, what: &str) -> String {
@@ -122,6 +133,15 @@ impl Monitor {
                 std::thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
             }
         }
+        // Every read failed. If the monitor's capabilities list this setting as
+        // missing, hide it; otherwise it is a real error (monitor off, DDC/CI off).
+        let (mut caps, mut temps) = (0u32, 0u32);
+        if unsafe { GetMonitorCapabilities(self.raw.hPhysicalMonitor, &mut caps, &mut temps) } != 0
+            && caps_lack(caps, s)
+        {
+            self.channels[s.index()].unsupported = true;
+            return;
+        }
         self.channels[s.index()].error = Some(self.fail_text(s, "read"));
     }
 }
@@ -155,8 +175,7 @@ fn read_edid(key: &str) -> Option<Vec<u8>> {
             && size <= 4096
         {
             let mut buf = vec![0u8; size as usize];
-            if RegQueryValueExW(h, PCWSTR(value.as_ptr()), None, None, Some(buf.as_mut_ptr()), Some(&mut size))
-                .is_ok()
+            if RegQueryValueExW(h, PCWSTR(value.as_ptr()), None, None, Some(buf.as_mut_ptr()), Some(&mut size)).is_ok()
             {
                 buf.truncate(size as usize);
                 out = Some(buf);
@@ -191,7 +210,7 @@ unsafe extern "system" fn enum_proc(h: HMONITOR, _: HDC, _: *mut RECT, data: LPA
 
 /// What Windows says about this display: number, stable key, position.
 /// Matched through the HMONITOR itself, never through enumeration order.
-fn display_info(h: HMONITOR) -> (Option<u32>, Option<String>, Option<(i32, i32, i32, i32)>) {
+fn display_info(h: HMONITOR) -> (Option<u32>, Option<String>, Option<Rect>) {
     let mut mi = MONITORINFOEXW::default();
     mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
     if !unsafe { GetMonitorInfoW(h, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO) }.as_bool() {
@@ -203,10 +222,8 @@ fn display_info(h: HMONITOR) -> (Option<u32>, Option<String>, Option<(i32, i32, 
     let rect = Some((r.left, r.top, r.right, r.bottom));
 
     let mut dd = DISPLAY_DEVICEW { cb: std::mem::size_of::<DISPLAY_DEVICEW>() as u32, ..Default::default() };
-    let ok = unsafe {
-        EnumDisplayDevicesW(PCWSTR(mi.szDevice.as_ptr()), 0, &mut dd, EDD_GET_DEVICE_INTERFACE_NAME)
-    }
-    .as_bool();
+    let ok = unsafe { EnumDisplayDevicesW(PCWSTR(mi.szDevice.as_ptr()), 0, &mut dd, EDD_GET_DEVICE_INTERFACE_NAME) }
+        .as_bool();
     let path = String::from_utf16_lossy(&dd.DeviceID).trim_end_matches('\0').to_ascii_lowercase();
     let key = if ok && !path.is_empty() { Some(path) } else { None };
     (number, key, rect)
@@ -217,12 +234,7 @@ fn display_info(h: HMONITOR) -> (Option<u32>, Option<String>, Option<(i32, i32, 
 pub fn discover() -> Monitors {
     let mut handles: Vec<HMONITOR> = Vec::new();
     unsafe {
-        let _ = EnumDisplayMonitors(
-            HDC::default(),
-            None,
-            Some(enum_proc),
-            LPARAM(&mut handles as *mut _ as isize),
-        );
+        let _ = EnumDisplayMonitors(HDC::default(), None, Some(enum_proc), LPARAM(&mut handles as *mut _ as isize));
     }
     let mut list = Vec::new();
     for h in handles {

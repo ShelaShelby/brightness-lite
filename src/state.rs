@@ -1,13 +1,13 @@
 //! Shared app state: monitors, saved values, startup flag. This is the same
 //! logic as before the restyle, moved out of the window code. No UI here.
 
+use crate::autostart;
 use crate::cache::{Cache, View};
 use crate::{ddc, store};
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use crate::autostart;
 
 /// After a plug/unplug or wake-up event, wait this long for more events before looking.
 const SETTLE: Duration = Duration::from_secs(3);
@@ -20,14 +20,14 @@ const RETRY_TIMES: u32 = 3;
 /// user's choice is on, make sure the entry points at this exe; if off, leave it alone.
 fn sync_autostart(path: Option<&std::path::Path>) {
     let Ok(exe) = std::env::current_exe() else { return };
-    let mut settings = path.map(store::load).unwrap_or_default();
-    if settings.autostart.is_none() {
-        settings.autostart = Some(autostart::DEFAULT_ON);
+    let mut choice = path.map(store::load).unwrap_or_default().autostart;
+    if choice.is_none() {
+        choice = Some(autostart::DEFAULT_ON);
         if let Some(p) = path {
-            let _ = store::save(p, &settings);
+            let _ = store::update(p, |s| s.autostart = s.autostart.or(choice));
         }
     }
-    if settings.autostart == Some(true) {
+    if choice == Some(true) {
         let _ = autostart::refresh(&exe);
     }
 }
@@ -126,38 +126,35 @@ impl Core {
         crate::cache::display_order(&self.cache.views, &self.order)
     }
 
+    /// True if the cards at `pos` and `pos + 1` can be swapped.
+    pub fn can_swap(&self, pos: usize) -> bool {
+        crate::order::can_swap(&crate::cache::keys(&self.cache.views), &self.order, pos)
+    }
+
     /// Swap the cards shown at `pos` and `pos + 1` and save the new order.
     /// Only the position on screen changes; each card stays bound to its monitor.
     pub fn swap(&mut self, pos: usize) {
-        let mut shown = self.display_order();
-        if pos + 1 >= shown.len() {
+        let Some(next) = crate::order::swapped(&crate::cache::keys(&self.cache.views), &self.order, pos) else {
             return;
-        }
-        shown.swap(pos, pos + 1);
-        let keys: Vec<String> = shown.iter().filter_map(|&i| self.cache.views[i].key.clone()).collect();
-        self.order = store::reordered(&self.order, &keys);
+        };
+        self.order = next;
         if let Some(p) = &self.settings_path {
-            let mut settings = store::load(p);
-            settings.order = self.order.clone();
-            let _ = store::save(p, &settings);
+            let order = self.order.clone();
+            let _ = store::update(p, |s| s.order = order);
         }
     }
 
     /// Turn the startup entry on or off. On failure the flag is unchanged
     /// and the reason is shown in the status lines.
     pub fn set_startup(&mut self, on: bool) {
-        let result = std::env::current_exe()
-            .map_err(|e| e.to_string())
-            .and_then(|exe| autostart::set(on, &exe));
+        let result = std::env::current_exe().map_err(|e| e.to_string()).and_then(|exe| autostart::set(on, &exe));
         match result {
             Ok(()) => {
                 self.startup_error.clear();
                 self.startup = on;
                 // Remember the choice, so it is not switched back on at the next start.
                 if let Some(p) = &self.settings_path {
-                    let mut settings = store::load(p);
-                    settings.autostart = Some(on);
-                    let _ = store::save(p, &settings);
+                    let _ = store::update(p, |s| s.autostart = Some(on));
                 }
             }
             Err(e) => {
@@ -175,10 +172,9 @@ impl Core {
 fn restore_saved(monitors: &mut ddc::Monitors, saved: &store::Settings) {
     for m in monitors.list.iter_mut() {
         let Some(entry) = m.key.as_deref().and_then(|k| saved.find(k)) else { continue };
-        for (setting, want) in [
-            (ddc::Setting::Brightness, entry.brightness_pct()),
-            (ddc::Setting::Contrast, entry.contrast_pct()),
-        ] {
+        for (setting, want) in
+            [(ddc::Setting::Brightness, entry.brightness_pct()), (ddc::Setting::Contrast, entry.contrast_pct())]
+        {
             if m.percent(setting).is_some_and(|now| now != want) {
                 let _ = m.set(setting, want);
             }
@@ -188,6 +184,12 @@ fn restore_saved(monitors: &mut ddc::Monitors, saved: &store::Settings) {
 
 fn scan(restore: bool, path: Option<&std::path::Path>) -> ddc::Monitors {
     let mut monitors = ddc::discover();
+    // Two monitors must never share a key (identical models without a serial number).
+    let mut keys: Vec<Option<String>> = monitors.list.iter_mut().map(|m| m.key.take()).collect();
+    crate::order::make_unique(&mut keys);
+    for (m, k) in monitors.list.iter_mut().zip(keys) {
+        m.key = k;
+    }
     if restore {
         let saved = path.map(store::load).unwrap_or_default();
         restore_saved(&mut monitors, &saved);
@@ -204,8 +206,9 @@ fn views_of(monitors: &ddc::Monitors) -> Vec<View> {
             name: m.name.clone(),
             key: m.key.clone(),
             rect: m.rect,
-            values: [m.percent(ddc::Setting::Brightness), m.percent(ddc::Setting::Contrast)],
-            errors: m.errors(),
+            values: ddc::Setting::ALL.map(|s| m.percent(s)),
+            supported: ddc::Setting::ALL.map(|s| m.supported(s)),
+            errors: ddc::Setting::ALL.iter().filter_map(|&s| m.error(s)).collect(),
         })
         .collect()
 }
@@ -343,8 +346,15 @@ fn worker(core: Arc<Mutex<Core>>, rx: Receiver<Cmd>, notify: fn()) {
                     let saved = path.as_deref().map(store::load).unwrap_or_default();
                     for m in monitors.list.iter_mut() {
                         let Some(entry) = m.key.as_deref().and_then(|k| saved.find(k)) else { continue };
-                        let _ = m.set(ddc::Setting::Brightness, entry.brightness_pct());
-                        let _ = m.set(ddc::Setting::Contrast, entry.contrast_pct());
+                        for (setting, want) in [
+                            (ddc::Setting::Brightness, entry.brightness_pct()),
+                            (ddc::Setting::Contrast, entry.contrast_pct()),
+                        ] {
+                            // Only settings the monitor answered for (never an unsupported one).
+                            if m.percent(setting).is_some_and(|now| now != want) {
+                                failed |= m.set(setting, want).is_err();
+                            }
+                        }
                     }
                 }
                 Cmd::Quit(done) => quit = Some(done),
@@ -379,7 +389,10 @@ fn worker(core: Arc<Mutex<Core>>, rx: Receiver<Cmd>, notify: fn()) {
                 generation += 1;
             }
             let notes = monitors.notes.clone();
-            let changed = !g.cache.scanned || g.cache.views != views || g.cache.notes != notes || g.cache.generation != generation;
+            let changed = !g.cache.scanned
+                || g.cache.views != views
+                || g.cache.notes != notes
+                || g.cache.generation != generation;
             if changed {
                 g.cache.replace(views.clone(), generation, notes);
             }
@@ -390,7 +403,7 @@ fn worker(core: Arc<Mutex<Core>>, rx: Receiver<Cmd>, notify: fn()) {
         }
         if save {
             if let Some(p) = &path {
-                let _ = store::save(p, &crate::cache::to_settings(&views, &store::load(p)));
+                let _ = store::update(p, |s| *s = crate::cache::to_settings(&views, s));
             }
         }
         if let Some(done) = quit {
@@ -466,7 +479,15 @@ mod tests {
     #[test]
     fn coalesce_keeps_last_write_and_sums_hotkeys() {
         let w = |g, index, value| Cmd::Write { generation: g, index, setting: ddc::Setting::Brightness, value };
-        let out = coalesce(vec![w(1, 0, 10), Cmd::Hotkey(5), w(1, 1, 20), w(1, 0, 30), Cmd::Hotkey(5), Cmd::Rescan, Cmd::Hotkey(-5)]);
+        let out = coalesce(vec![
+            w(1, 0, 10),
+            Cmd::Hotkey(5),
+            w(1, 1, 20),
+            w(1, 0, 30),
+            Cmd::Hotkey(5),
+            Cmd::Rescan,
+            Cmd::Hotkey(-5),
+        ]);
         assert_eq!(out.len(), 4);
         assert!(matches!(out[0], Cmd::Write { index: 1, value: 20, .. }));
         assert!(matches!(out[1], Cmd::Write { index: 0, value: 30, .. }));

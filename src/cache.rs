@@ -6,7 +6,7 @@ use crate::{ddc::Setting, store};
 type Rect = (i32, i32, i32, i32);
 
 /// One monitor as the window sees it.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct View {
     /// Display number ("Monitor 2"), if known.
     pub display_number: Option<u32>,
@@ -18,13 +18,33 @@ pub struct View {
     pub rect: Option<Rect>,
     /// Brightness and contrast as 0-100, None if the monitor never answered.
     pub values: [Option<u32>; 2],
+    /// False for a setting the monitor said it does not support (its slider is hidden).
+    pub supported: [bool; 2],
     /// Messages about settings that failed on this monitor.
     pub errors: Vec<String>,
+}
+
+impl Default for View {
+    fn default() -> View {
+        View {
+            display_number: None,
+            name: None,
+            key: None,
+            rect: None,
+            values: [None; 2],
+            supported: [true; 2],
+            errors: Vec::new(),
+        }
+    }
 }
 
 impl View {
     pub fn label(&self) -> String {
         crate::ddc::label_for(self.display_number)
+    }
+
+    pub fn supports(&self, st: Setting) -> bool {
+        self.supported[st.index()]
     }
 
     pub fn value(&self, st: Setting) -> Option<u32> {
@@ -61,14 +81,14 @@ impl Cache {
     }
 }
 
-/// Indices into `views` in the order the cards are shown: monitors listed in
-/// `order` (saved keys) first, in that order; all others after them, in the
-/// order they were found.
+/// Indices into `views` in the order the cards are shown (see `order::shown`).
 pub fn display_order(views: &[View], order: &[String]) -> Vec<usize> {
-    let rank = |v: &View| v.key.as_ref().and_then(|k| order.iter().position(|o| o == k)).unwrap_or(usize::MAX);
-    let mut idx: Vec<usize> = (0..views.len()).collect();
-    idx.sort_by_key(|&i| rank(&views[i])); // stable: unknown ones keep their found order
-    idx
+    crate::order::shown(&keys(views), order)
+}
+
+/// The key of each view, in list order.
+pub fn keys(views: &[View]) -> Vec<Option<&str>> {
+    views.iter().map(|v| v.key.as_deref()).collect()
 }
 
 /// Settings to write to disk, built from cached values alone (no monitor read).
@@ -110,8 +130,12 @@ mod tests {
 
     #[test]
     fn unreadable_value_keeps_old_saved_number() {
-        let old = store::Settings { monitors: vec![store::SavedMonitor { key: "a".into(), brightness: 30, contrast: 20 }], ..Default::default() };
-        let cache = Cache { views: vec![view("a", None, Some(55))], scanned: true, generation: 1, ..Default::default() };
+        let old = store::Settings {
+            monitors: vec![store::SavedMonitor { key: "a".into(), brightness: 30, contrast: 20 }],
+            ..Default::default()
+        };
+        let cache =
+            Cache { views: vec![view("a", None, Some(55))], scanned: true, generation: 1, ..Default::default() };
         let saved = to_settings(&cache.views, &old);
         let m = saved.find("a").unwrap();
         assert_eq!((m.brightness, m.contrast), (30, 55));
@@ -121,38 +145,11 @@ mod tests {
         View { key: key.map(Into::into), ..Default::default() }
     }
 
-    fn keys(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
-    }
-
     #[test]
-    fn display_order_follows_saved_keys() {
-        let views = [keyed(Some("a")), keyed(Some("b")), keyed(Some("c"))];
-        assert_eq!(display_order(&views, &[]), vec![0, 1, 2]);
-        assert_eq!(display_order(&views, &keys(&["c", "a", "b"])), vec![2, 0, 1]);
-    }
-
-    #[test]
-    fn unknown_monitors_go_at_the_end() {
-        let views = [keyed(Some("new1")), keyed(None), keyed(Some("b")), keyed(Some("new2")), keyed(Some("a"))];
-        // Saved keys of monitors that are not connected ("gone") are skipped.
-        assert_eq!(display_order(&views, &keys(&["gone", "a", "b"])), vec![4, 2, 0, 1, 3]);
-    }
-
-    #[test]
-    fn order_survives_unplug_and_replug() {
-        let (a, b, c) = (keyed(Some("a")), keyed(Some("b")), keyed(Some("c")));
-        let mut order = keys(&["c", "a", "b"]);
-        // "a" unplugged: the others keep their relative order.
-        let two = [b.clone(), c.clone()];
-        assert_eq!(display_order(&two, &order), vec![1, 0]);
-        // The user swaps the two shown ones (now b above c) while "a" is away.
-        order = store::reordered(&order, &keys(&["b", "c"]));
-        assert_eq!(order, keys(&["b", "a", "c"]));
-        // "a" plugged back in (found in another position): it goes back to its place.
-        let three = [c, a, b];
-        let shown: Vec<_> = display_order(&three, &order).iter().map(|&i| three[i].key.clone().unwrap()).collect();
-        assert_eq!(shown, keys(&["b", "a", "c"]));
+    fn display_order_uses_the_view_keys() {
+        let views = [keyed(Some("new")), keyed(None), keyed(Some("b")), keyed(Some("a"))];
+        let order = vec!["gone".to_string(), "a".into(), "b".into()];
+        assert_eq!(display_order(&views, &order), vec![3, 2, 0, 1]);
     }
 
     #[test]

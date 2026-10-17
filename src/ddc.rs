@@ -40,6 +40,7 @@ pub fn raw_to_percent(raw: u32, min: u32, max: u32) -> u32 {
 
 /// "\\.\DISPLAY3" -> Some(3). This is the number Windows shows in
 /// Settings > System > Display. Anything else -> None (never guessed).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn parse_display_number(gdi_name: &str) -> Option<u32> {
     let upper = gdi_name.trim_end_matches('\0').to_ascii_uppercase();
     let rest = upper.strip_prefix("\\\\.\\DISPLAY")?;
@@ -52,6 +53,7 @@ pub fn parse_display_number(gdi_name: &str) -> Option<u32> {
 /// Registry path of the EDID for a monitor's device interface path.
 /// The interface path looks like `\\?\display#del40e5#5&2a5c7f4d&0&uid4352#{guid}`; the EDID
 /// is under `HKLM\SYSTEM\CurrentControlSet\Enum\DISPLAY\DEL40E5\5&2a5c7f4d&0&uid4352\Device Parameters`.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn edid_registry_subkey(interface_path: &str) -> Option<String> {
     let rest = interface_path.strip_prefix("\\\\?\\")?;
     let mut parts = rest.split('#');
@@ -78,6 +80,7 @@ pub fn label_for(display_number: Option<u32>) -> String {
 }
 
 /// Sort key: Windows display number first, unknown ones last, then position.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn order_key(display_number: Option<u32>, left: i32, top: i32) -> (u32, i32, i32) {
     (display_number.unwrap_or(u32::MAX), left, top)
 }
@@ -116,6 +119,17 @@ impl Setting {
             Setting::Contrast => "contrast",
         }
     }
+}
+
+/// Windows: true if the monitor's capability bits (from GetMonitorCapabilities)
+/// say it has no such control. Bits: 0x2 brightness, 0x4 contrast.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn caps_lack(caps: u32, s: Setting) -> bool {
+    let bit = match s {
+        Setting::Brightness => 0x2,
+        Setting::Contrast => 0x4,
+    };
+    caps & bit == 0
 }
 
 #[cfg(windows)]
@@ -172,7 +186,7 @@ mod tests {
     #[test]
     fn order_follows_display_number_not_enumeration() {
         // Enumeration returned display 2 first; the list must still start with 1.
-        let mut v = vec![(Some(2), 1920, 0), (None, 0, 0), (Some(1), 0, 0), (Some(3), -1920, 0)];
+        let mut v = [(Some(2), 1920, 0), (None, 0, 0), (Some(1), 0, 0), (Some(3), -1920, 0)];
         v.sort_by_key(|(n, l, t)| order_key(*n, *l, *t));
         let numbers: Vec<_> = v.iter().map(|x| x.0).collect();
         assert_eq!(numbers, vec![Some(1), Some(2), Some(3), None]);
@@ -196,6 +210,15 @@ mod tests {
         for s in Setting::ALL {
             assert_eq!(Setting::from_index(s.index()), s);
         }
+    }
+
+    #[test]
+    fn capability_bits() {
+        assert!(!caps_lack(0x6, Setting::Brightness));
+        assert!(!caps_lack(0x6, Setting::Contrast));
+        assert!(caps_lack(0x2, Setting::Contrast));
+        assert!(!caps_lack(0x2, Setting::Brightness));
+        assert!(caps_lack(0, Setting::Brightness));
     }
 
     #[test]

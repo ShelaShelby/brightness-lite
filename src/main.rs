@@ -3,26 +3,28 @@
 //! Windows: Win32 + tray-icon. Linux: /dev/i2c + StatusNotifierItem tray.
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
-#![cfg_attr(not(windows), allow(dead_code))]
 
-mod cache;
-mod ddc;
-mod edid;
-mod store;
-#[cfg(any(windows, target_os = "linux"))]
-mod autostart;
-#[cfg(any(windows, target_os = "linux"))]
-mod state;
-#[cfg(any(windows, target_os = "linux"))]
-mod ui;
-#[cfg(windows)]
-mod identify;
-#[cfg(windows)]
-mod app_windows;
-#[cfg(target_os = "linux")]
-mod ddcci;
 #[cfg(target_os = "linux")]
 mod app_linux;
+#[cfg(windows)]
+mod app_windows;
+#[cfg(any(windows, target_os = "linux"))]
+mod autostart;
+mod cache;
+mod ddc;
+#[cfg(target_os = "linux")]
+mod ddcci;
+mod edid;
+#[cfg(target_os = "linux")]
+mod hotkey_x11;
+#[cfg(windows)]
+mod identify;
+mod order;
+#[cfg(any(windows, target_os = "linux"))]
+mod state;
+mod store;
+#[cfg(any(windows, target_os = "linux"))]
+mod ui;
 
 #[cfg(not(any(windows, target_os = "linux")))]
 fn main() {

@@ -1,6 +1,6 @@
 [package]
 name = "brightness-lite"
-version = "0.2.3"
+version = "0.3.0"
 edition = "2021"
 description = "Tray app for external monitor brightness and contrast over DDC/CI. Windows and Linux."
 license = "MIT"
@@ -17,9 +17,13 @@ raw-window-handle = "=0.6.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "=0.37.0", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
-ksni = { version = "=0.3.6", default-features = false, features = ["async-io", "blocking"] }
-global-hotkey = { version = "=0.8.0", default-features = false }
+# tokio, not async-io: its idle helper threads stop. With async-io one woke up twice a second.
+ksni = { version = "=0.3.6", default-features = false, features = ["tokio", "blocking"] }
 libc = "=0.2.190"
+# Already used by the window (winit); also grabs the X11 hotkeys.
+x11rb = { version = "=0.13.2", default-features = false, features = ["xkb"] }
+# Already used by ksni; also listens for logind's wake-up signal.
+zbus = { version = "=5.19.0", default-features = false, features = ["tokio", "blocking-api"] }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "=0.58.0"
@@ -37,8 +41,10 @@ features = [
     "Win32_UI_WindowsAndMessaging",
 ]
 
+# Small and fast: "s" gave a smaller file than "z" here. Nothing catches a
+# panic (no catch_unwind), so abort on panic is safe and saves space.
 [profile.release]
-opt-level = "z"
+opt-level = "s"
 lto = true
 codegen-units = 1
 strip = true

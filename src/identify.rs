@@ -4,10 +4,9 @@
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect,
-    SelectObject, SetBkMode, SetTextColor, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_QUALITY,
-    DT_CENTER, DT_SINGLELINE, DT_VCENTER, FF_DONTCARE, FW_BOLD, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
-    TRANSPARENT,
+    BeginPaint, CreateFontW, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, SelectObject, SetBkMode,
+    SetTextColor, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_QUALITY, DT_CENTER, DT_SINGLELINE, DT_VCENTER,
+    FF_DONTCARE, FW_BOLD, OUT_DEFAULT_PRECIS, PAINTSTRUCT, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -27,9 +26,20 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> 
             FillRect(hdc, &r, bg);
             let _ = DeleteObject(bg);
             let font = CreateFontW(
-                -150, 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0, DEFAULT_CHARSET.0 as u32,
-                OUT_DEFAULT_PRECIS.0 as u32, CLIP_DEFAULT_PRECIS.0 as u32, DEFAULT_QUALITY.0 as u32,
-                FF_DONTCARE.0 as u32, w!("Segoe UI"),
+                -150,
+                0,
+                0,
+                0,
+                FW_BOLD.0 as i32,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET.0 as u32,
+                OUT_DEFAULT_PRECIS.0 as u32,
+                CLIP_DEFAULT_PRECIS.0 as u32,
+                DEFAULT_QUALITY.0 as u32,
+                FF_DONTCARE.0 as u32,
+                w!("Segoe UI"),
             );
             let old = SelectObject(hdc, font);
             SetBkMode(hdc, TRANSPARENT);
@@ -61,12 +71,8 @@ pub fn show(text: String, rect: (i32, i32, i32, i32)) {
     std::thread::spawn(move || unsafe {
         let hinst = GetModuleHandleW(None).unwrap_or_default();
         let class = w!("BrightnessLiteIdentify");
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(proc),
-            hInstance: hinst.into(),
-            lpszClassName: class,
-            ..Default::default()
-        };
+        let wc =
+            WNDCLASSW { lpfnWndProc: Some(proc), hInstance: hinst.into(), lpszClassName: class, ..Default::default() };
         RegisterClassW(&wc); // fails harmlessly if it is already registered
         let x = rect.0 + (rect.2 - rect.0 - SIZE) / 2;
         let y = rect.1 + (rect.3 - rect.1 - SIZE) / 2;
@@ -76,8 +82,14 @@ pub fn show(text: String, rect: (i32, i32, i32, i32)) {
             class,
             PCWSTR(t.as_ptr()),
             WS_POPUP | WS_VISIBLE,
-            x, y, SIZE, SIZE,
-            None, None, hinst, None,
+            x,
+            y,
+            SIZE,
+            SIZE,
+            None,
+            None,
+            hinst,
+            None,
         ) else {
             return;
         };

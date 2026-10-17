@@ -1,10 +1,13 @@
 //! Linux shell around the shared logic: StatusNotifierItem tray (ksni), X11
-//! hotkeys (global-hotkey), hotplug/resume watcher (netlink) and the egui window.
+//! hotkeys (x11rb), plug/unplug watcher (netlink), wake-up watcher (logind) and
+//! the egui window.
 
-use crate::{ddc, state::{self, Cmd, Core}, ui};
+use crate::{
+    ddc, hotkey_x11,
+    state::{self, Cmd, Core},
+    ui,
+};
 use eframe::egui;
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use ksni::blocking::{Handle, TrayMethods};
 use ksni::menu::{CheckmarkItem, MenuItem, StandardItem};
 use std::fs::{File, OpenOptions};
@@ -63,29 +66,9 @@ fn quit(core: &Shared) -> ! {
     std::process::exit(0);
 }
 
-// ---- icon: a blue disc with a lighter centre, drawn in code ----
-
-fn icon_rgba() -> Vec<u8> {
-    let n = 32usize;
-    let mut rgba = vec![0u8; n * n * 4];
-    for y in 0..n {
-        for x in 0..n {
-            let (dx, dy) = (x as f32 + 0.5 - 16.0, y as f32 + 0.5 - 16.0);
-            let d = (dx * dx + dy * dy).sqrt();
-            let px = if d <= 13.0 {
-                if d <= 6.0 { [0xe6, 0xee, 0xff, 0xff] } else { [0x4c, 0x8d, 0xff, 0xff] }
-            } else {
-                [0, 0, 0, 0]
-            };
-            rgba[(y * n + x) * 4..(y * n + x) * 4 + 4].copy_from_slice(&px);
-        }
-    }
-    rgba
-}
-
 /// RGBA -> ARGB32 in network byte order, as the tray protocol wants it.
 fn rgba_to_argb(rgba: &[u8]) -> Vec<u8> {
-    rgba.chunks_exact(4).flat_map(|p| [p[3], p[0], p[1], p[2]]).collect()
+    rgba.as_chunks::<4>().0.iter().flat_map(|p| [p[3], p[0], p[1], p[2]]).collect()
 }
 
 // ---- tray ----
@@ -105,7 +88,7 @@ impl ksni::Tray for BrightnessTray {
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
-        vec![ksni::Icon { width: 32, height: 32, data: rgba_to_argb(&icon_rgba()) }]
+        vec![ksni::Icon { width: 32, height: 32, data: rgba_to_argb(&ui::icon_rgba()) }]
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
@@ -114,12 +97,7 @@ impl ksni::Tray for BrightnessTray {
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         vec![
-            StandardItem {
-                label: "Open".into(),
-                activate: Box::new(|_| request_show()),
-                ..Default::default()
-            }
-            .into(),
+            StandardItem { label: "Open".into(), activate: Box::new(|_| request_show()), ..Default::default() }.into(),
             CheckmarkItem {
                 label: ui::STARTUP_LABEL.into(),
                 checked: self.startup,
@@ -184,34 +162,17 @@ fn start_hotkeys(core: Shared) {
         lock(&core).hotkey_error = msg.into();
         return;
     }
-    let mods = Some(Modifiers::CONTROL | Modifiers::ALT);
-    let up = HotKey::new(mods, Code::ArrowUp);
-    let down = HotKey::new(mods, Code::ArrowDown);
-    let manager = match GlobalHotKeyManager::new() {
-        Ok(m) => m,
-        Err(_) => {
-            lock(&core).hotkey_error = "Hotkeys Ctrl+Alt+Up/Down could not be set up.".into();
-            return;
-        }
+    let tx = lock(&core).sender();
+    let result = hotkey_x11::start(move |key| {
+        let step = if key == hotkey_x11::Key::Up { ddc::STEP } else { -ddc::STEP };
+        // The monitor thread redraws the window when the values have changed.
+        let _ = tx.send(Cmd::Hotkey(step));
+    });
+    lock(&core).hotkey_error = match result {
+        Ok(()) => String::new(),
+        Err(hotkey_x11::Failure::Taken) => "Hotkeys Ctrl+Alt+Up/Down are already used by another program.".into(),
+        Err(hotkey_x11::Failure::NoX11) => "Hotkeys Ctrl+Alt+Up/Down could not be set up.".into(),
     };
-    if manager.register(up).is_err() || manager.register(down).is_err() {
-        lock(&core).hotkey_error = "Hotkeys Ctrl+Alt+Up/Down are already used by another program.".into();
-    }
-    let (up_id, down_id) = (up.id(), down.id());
-    let c = core.clone();
-    GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
-        if e.state() != HotKeyState::Pressed {
-            return;
-        }
-        if e.id() == up_id {
-            lock(&c).send(Cmd::Hotkey(ddc::STEP));
-        } else if e.id() == down_id {
-            lock(&c).send(Cmd::Hotkey(-ddc::STEP));
-        }
-        repaint();
-    }));
-    // The manager must stay alive for as long as the app runs.
-    std::mem::forget(manager);
 }
 
 // ---- monitor plug/unplug and wake-up: put the saved values back ----
@@ -251,20 +212,54 @@ fn sleep_offset() -> Option<Duration> {
     Some(boot.saturating_sub(mono))
 }
 
+/// Without the logind wake-up signal, look at the clocks this often to notice a wake-up.
 const TICK_MS: i32 = 30_000;
+/// The logind listener is running, so no timer is needed to notice a wake-up.
+static WAKE_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+/// logind (systemd or elogind) sends PrepareForSleep(false) on the system bus
+/// right after the computer wakes up. Waiting for it costs nothing while idle.
+fn start_wake_listener(tx: std::sync::mpsc::Sender<Cmd>) {
+    std::thread::spawn(move || {
+        let Ok(conn) = zbus::blocking::Connection::system() else { return };
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .path("/org/freedesktop/login1")
+            .and_then(|b| b.interface("org.freedesktop.login1.Manager"))
+            .and_then(|b| b.member("PrepareForSleep"))
+            .map(|b| b.build());
+        let Ok(rule) = rule else { return };
+        let Ok(signals) = zbus::blocking::MessageIterator::for_match_rule(rule, &conn, None) else { return };
+        WAKE_SIGNAL.store(true, Ordering::Relaxed);
+        for msg in signals.flatten() {
+            // true = about to sleep, false = just woke up.
+            if msg.body().deserialize::<bool>().ok() == Some(false) && tx.send(Cmd::DevicesChanged).is_err() {
+                break;
+            }
+        }
+        WAKE_SIGNAL.store(false, Ordering::Relaxed);
+    });
+}
 
 fn start_hotplug(core: Shared) {
     let tx = lock(&core).sender();
+    start_wake_listener(tx.clone());
     std::thread::spawn(move || {
         // Kernel uevents (group 1). Needs no special rights.
-        let fd = unsafe { libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::NETLINK_KOBJECT_UEVENT) };
+        let fd = unsafe {
+            libc::socket(libc::AF_NETLINK, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, libc::NETLINK_KOBJECT_UEVENT)
+        };
         let mut listening = fd >= 0;
         if listening {
             let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
             addr.nl_family = libc::AF_NETLINK as libc::sa_family_t;
             addr.nl_groups = 1;
             let r = unsafe {
-                libc::bind(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_nl>() as u32)
+                libc::bind(
+                    fd,
+                    &addr as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_nl>() as u32,
+                )
             };
             listening = r == 0;
             if !listening {
@@ -275,10 +270,14 @@ fn start_hotplug(core: Shared) {
         let mut buf = vec![0u8; 8192];
         loop {
             let mut ready = false;
+            // With the wake-up signal, wait for kernel events only: no timer at all.
+            let timeout = if WAKE_SIGNAL.load(Ordering::Relaxed) { -1 } else { TICK_MS };
             if listening {
                 let mut p = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-                let r = unsafe { libc::poll(&mut p, 1, TICK_MS) };
+                let r = unsafe { libc::poll(&mut p, 1, timeout) };
                 ready = r > 0 && p.revents & libc::POLLIN != 0;
+            } else if timeout < 0 {
+                return; // nothing left for this thread to watch
             } else {
                 std::thread::sleep(Duration::from_millis(TICK_MS as u64));
             }
@@ -379,11 +378,7 @@ impl eframe::App for BrightnessApp {
                 if VISIBLE.load(Ordering::Relaxed) {
                     self.hide(ctx);
                 } else {
-                    let just_hid = FOCUS_HIDE
-                        .lock()
-                        .ok()
-                        .and_then(|g| *g)
-                        .is_some_and(|t| t.elapsed() < REOPEN_GUARD);
+                    let just_hid = FOCUS_HIDE.lock().ok().and_then(|g| *g).is_some_and(|t| t.elapsed() < REOPEN_GUARD);
                     if !just_hid {
                         self.show(ctx);
                     }
@@ -463,7 +458,7 @@ pub fn run() {
             .with_minimize_button(false)
             .with_always_on_top()
             .with_taskbar(!tray_ok)
-            .with_icon(egui::IconData { rgba: icon_rgba(), width: 32, height: 32 })
+            .with_icon(egui::IconData { rgba: ui::icon_rgba(), width: 32, height: 32 })
             .with_visible(false),
         ..Default::default()
     };
@@ -474,7 +469,12 @@ pub fn run() {
         Box::new(move |cc| {
             ui::apply_theme(&cc.egui_ctx);
             let _ = CTX.set(cc.egui_ctx.clone());
-            Ok(Box::new(BrightnessApp { core: core.clone(), ui: ui::UiState::default(), armed: false, first_hide_done: false }))
+            Ok(Box::new(BrightnessApp {
+                core: core.clone(),
+                ui: ui::UiState::default(),
+                armed: false,
+                first_hide_done: false,
+            }))
         }),
     );
     if let Err(e) = result {
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn tray_icon_is_argb() {
-        let rgba = icon_rgba();
+        let rgba = ui::icon_rgba();
         let argb = rgba_to_argb(&rgba);
         assert_eq!(argb.len(), rgba.len());
         // Centre pixel: opaque light blue -> A R G B.

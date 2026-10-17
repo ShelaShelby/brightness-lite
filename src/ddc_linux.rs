@@ -47,15 +47,14 @@ fn pause() {
     std::thread::sleep(Duration::from_millis(WAIT_MS));
 }
 
-/// One "get VCP" round trip: (current, maximum).
-fn get_raw(bus: u32, code: u8) -> io::Result<(u32, u32)> {
+/// One "get VCP" round trip. Outer error: the bus failed. Inner: the reply was not usable.
+fn get_raw(bus: u32, code: u8) -> io::Result<Result<(u32, u32), ddcci::ReplyError>> {
     let mut f = open_bus(bus, ADDRESS)?;
     f.write_all(&ddcci::get_request(code))?;
     pause();
     let mut buf = [0u8; REPLY_LEN];
     let n = f.read(&mut buf)?;
-    ddcci::parse_get_reply(&buf[..n], code)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{e:?}")))
+    Ok(ddcci::parse_get_reply(&buf[..n], code))
 }
 
 /// One "set VCP" write.
@@ -98,6 +97,8 @@ pub struct Channel {
     max: u32,
     pub percent: Option<u32>,
     pub error: Option<String>,
+    /// The monitor answered that it does not have this setting.
+    pub unsupported: bool,
 }
 
 pub struct Monitor {
@@ -122,8 +123,14 @@ impl Monitor {
         self.channels[s.index()].percent
     }
 
-    pub fn errors(&self) -> Vec<String> {
-        self.channels.iter().filter_map(|c| c.error.clone()).collect()
+    /// The error of one setting, if it failed.
+    pub fn error(&self, s: Setting) -> Option<String> {
+        self.channels[s.index()].error.clone()
+    }
+
+    /// False if the monitor said it does not have this setting.
+    pub fn supported(&self, s: Setting) -> bool {
+        !self.channels[s.index()].unsupported
     }
 
     fn fail_text(&self, s: Setting, what: &str) -> String {
@@ -153,14 +160,20 @@ impl Monitor {
     /// Read range and current value. Retries up to MAX_ATTEMPTS.
     fn read(&mut self, s: Setting) {
         for attempt in 1..=MAX_ATTEMPTS {
-            if let Ok((cur, max)) = get_raw(self.bus, code_of(s)) {
-                if max > 0 {
+            match get_raw(self.bus, code_of(s)) {
+                Ok(Ok((cur, max))) if max > 0 => {
                     let ch = &mut self.channels[s.index()];
                     ch.max = max;
                     ch.percent = Some(raw_to_percent(cur, 0, max));
                     ch.error = None;
                     return;
                 }
+                // A valid reply that says "no such setting": hide it, it is not an error.
+                Ok(Err(ddcci::ReplyError::Unsupported)) => {
+                    self.channels[s.index()].unsupported = true;
+                    return;
+                }
+                _ => {}
             }
             if attempt < MAX_ATTEMPTS {
                 std::thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
@@ -296,7 +309,10 @@ pub fn discover() -> Monitors {
                 continue;
             }
             if let Some(e) = read_edid_i2c(bus) {
-                if let Some(c) = connectors.iter_mut().find(|c| c.bus.is_none() && c.edid.as_deref().and_then(|d| d.get(..128)) == Some(&e[..])) {
+                if let Some(c) = connectors
+                    .iter_mut()
+                    .find(|c| c.bus.is_none() && c.edid.as_deref().and_then(|d| d.get(..128)) == Some(&e[..]))
+                {
                     c.bus = Some(bus);
                 }
             }
@@ -306,7 +322,11 @@ pub fn discover() -> Monitors {
     if connectors.is_empty() {
         return Monitors { list: Vec::new(), notes };
     }
-    if !Path::new("/dev").read_dir().map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().starts_with("i2c-"))).unwrap_or(false) {
+    if !Path::new("/dev")
+        .read_dir()
+        .map(|rd| rd.flatten().any(|e| e.file_name().to_string_lossy().starts_with("i2c-")))
+        .unwrap_or(false)
+    {
         notes.push("No /dev/i2c-* devices found. Load the i2c-dev module (see the README).".into());
     }
 
@@ -325,7 +345,11 @@ pub fn discover() -> Monitors {
         let mut m = Monitor {
             display_number: Some(list.len() as u32 + 1),
             key: Some(key),
-            name: Some(p.as_ref().map(|e| e.display_name()).unwrap_or_else(|| external_connector(&c.name).unwrap_or_else(|| c.name.clone()))),
+            name: Some(
+                p.as_ref()
+                    .map(|e| e.display_name())
+                    .unwrap_or_else(|| external_connector(&c.name).unwrap_or_else(|| c.name.clone())),
+            ),
             rect: None,
             bus,
             channels: [blank.clone(), blank],
@@ -388,7 +412,12 @@ mod tests {
         ]);
         assert_eq!(
             k,
-            vec!["del40e5-00000001@card0-DP-1", "del40e5-00000001@card0-DP-2", "gsm5b09-0000abcd", "connector:card1-DP-1"]
+            vec![
+                "del40e5-00000001@card0-DP-1",
+                "del40e5-00000001@card0-DP-2",
+                "gsm5b09-0000abcd",
+                "connector:card1-DP-1"
+            ]
         );
     }
 

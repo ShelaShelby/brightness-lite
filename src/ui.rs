@@ -1,9 +1,12 @@
 //! Window look: dark theme, one card per monitor, toggle switch, flat button.
 
-use crate::{ddc, state::{Cmd, Core}};
+use crate::{
+    ddc,
+    state::{Cmd, Core},
+};
 use eframe::egui::{
-    self, Align, Button, Color32, CornerRadius, Frame, Layout, Margin, RichText, Sense, Slider,
-    SliderOrientation, Stroke, StrokeKind, Vec2,
+    self, Align, Button, Color32, CornerRadius, Frame, Layout, Margin, RichText, Sense, Slider, SliderOrientation,
+    Stroke, StrokeKind, Vec2,
 };
 use std::collections::HashMap;
 
@@ -23,8 +26,12 @@ const MARGIN: i8 = 14;
 
 #[derive(Default)]
 pub struct UiState {
-    /// Slider values while the user is dragging (applied on release).
-    drag: HashMap<usize, f64>,
+    /// Slider values while the user is dragging (applied on release), by
+    /// (monitor index, setting index). Only valid for `generation`.
+    drag: HashMap<(usize, usize), f64>,
+    /// The monitor list the drag map belongs to. When the list changes
+    /// (plug/unplug), an index may point at another monitor, so the map is cleared.
+    generation: u64,
     last_height: f32,
 }
 
@@ -86,6 +93,29 @@ pub fn apply_theme(ctx: &egui::Context) {
     });
 }
 
+/// The app icon, 32x32 RGBA: a blue disc with a lighter centre, drawn in code.
+pub fn icon_rgba() -> Vec<u8> {
+    let n = 32usize;
+    let mut rgba = vec![0u8; n * n * 4];
+    for y in 0..n {
+        for x in 0..n {
+            let (dx, dy) = (x as f32 + 0.5 - 16.0, y as f32 + 0.5 - 16.0);
+            let d = (dx * dx + dy * dy).sqrt();
+            let px = if d <= 13.0 {
+                if d <= 6.0 {
+                    [0xe6, 0xee, 0xff, 0xff]
+                } else {
+                    [0x4c, 0x8d, 0xff, 0xff]
+                }
+            } else {
+                [0, 0, 0, 0]
+            };
+            rgba[(y * n + x) * 4..(y * n + x) * 4 + 4].copy_from_slice(&px);
+        }
+    }
+    rgba
+}
+
 fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     Frame::new()
         .fill(PANEL)
@@ -124,7 +154,13 @@ fn swap_button(ui: &mut egui::Ui, pos: usize, enabled: bool) -> egui::Response {
     let resp = ui.interact(rect, ui.make_persistent_id(("swap", pos)), sense);
     let resp = if enabled { resp.on_hover_text("Swap these two monitors") } else { resp };
     let fill = if resp.hovered() && enabled { Color32::from_rgb(0x27, 0x2b, 0x33) } else { PANEL };
-    let color = if !enabled { RAIL } else if resp.hovered() { TEXT } else { MUTED };
+    let color = if !enabled {
+        RAIL
+    } else if resp.hovered() {
+        TEXT
+    } else {
+        MUTED
+    };
     let p = ui.painter();
     p.rect(rect, RADIUS, fill, Stroke::new(1.0, BORDER), StrokeKind::Inside);
     let stroke = Stroke::new(1.5, color);
@@ -141,7 +177,7 @@ fn swap_button(ui: &mut egui::Ui, pos: usize, enabled: bool) -> egui::Response {
 }
 
 fn setting_row(ui: &mut egui::Ui, core: &mut Core, st_ui: &mut UiState, i: usize, st: ddc::Setting) {
-    let idx = i * 2 + st.index();
+    let idx = (i, st.index());
     let cur = core.cache.views[i].value(st);
     let mut v = st_ui.drag.get(&idx).copied().unwrap_or(cur.unwrap_or(0) as f64);
     let caption = if st == ddc::Setting::Brightness { "Brightness" } else { "Contrast" };
@@ -179,41 +215,58 @@ pub fn draw(ui: &mut egui::Ui, core: &mut Core, st_ui: &mut UiState) {
     let ctx = ui.ctx().clone();
     let outer = Frame::new().fill(BG).inner_margin(Margin::same(MARGIN)).show(ui, |ui| {
         ui.set_width(WINDOW_W - 2.0 * MARGIN as f32);
+        if st_ui.generation != core.cache.generation {
+            st_ui.generation = core.cache.generation;
+            st_ui.reset_drag();
+        }
+        // The whole frame is drawn in one order. A swap click is applied after
+        // it, and the next frame (asked for at once) shows the new order.
         let shown = core.display_order();
+        let mut swap_at = None;
         for (pos, &i) in shown.iter().enumerate() {
             if pos > 0 {
                 // Between two neighbouring cards: swap them on screen.
-                let keyed = |j: usize| core.cache.views[j].key.is_some();
-                if swap_button(ui, pos, keyed(shown[pos - 1]) && keyed(i)).clicked() {
-                    core.swap(pos - 1);
+                if swap_button(ui, pos, core.can_swap(pos - 1)).clicked() {
+                    swap_at = Some(pos - 1);
                 }
             }
-            // The id follows the monitor, not the position, so widget state stays with its card.
-            ui.push_id(("monitor", i), |ui| card(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(core.cache.views[i].label()).size(15.0).strong());
-                    #[cfg(windows)]
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let m = &core.cache.views[i];
-                        let target = m.display_number.zip(m.rect);
-                        let identify = Button::new(RichText::new("Identify").color(MUTED).size(12.0))
-                            .fill(PANEL)
-                            .stroke(Stroke::new(1.0, BORDER))
-                            .corner_radius(RADIUS);
-                        if ui.add_enabled(target.is_some(), identify).clicked() {
-                            if let Some((n, rect)) = target {
-                                crate::identify::show(n.to_string(), rect);
+            // The id follows the monitor (its key), not the position, so widget state stays with its card.
+            let id = core.cache.views[i].key.clone().unwrap_or_else(|| format!("#{i}"));
+            ui.push_id(("monitor", id), |ui| {
+                card(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(core.cache.views[i].label()).size(15.0).strong());
+                        #[cfg(windows)]
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            let m = &core.cache.views[i];
+                            let target = m.display_number.zip(m.rect);
+                            let identify = Button::new(RichText::new("Identify").color(MUTED).size(12.0))
+                                .fill(PANEL)
+                                .stroke(Stroke::new(1.0, BORDER))
+                                .corner_radius(RADIUS);
+                            if ui.add_enabled(target.is_some(), identify).clicked() {
+                                if let Some((n, rect)) = target {
+                                    crate::identify::show(n.to_string(), rect);
+                                }
                             }
-                        }
+                        });
                     });
-                });
-                if let Some(name) = core.cache.views[i].name.clone() {
-                    ui.add(egui::Label::new(RichText::new(name).color(MUTED).size(12.0)).truncate());
-                }
-                for st in ddc::Setting::ALL {
-                    setting_row(ui, core, st_ui, i, st);
-                }
-            }));
+                    if let Some(name) = core.cache.views[i].name.clone() {
+                        ui.add(egui::Label::new(RichText::new(name).color(MUTED).size(12.0)).truncate());
+                    }
+                    for st in ddc::Setting::ALL {
+                        // A setting the monitor does not have is not shown at all.
+                        if core.cache.views[i].supports(st) {
+                            setting_row(ui, core, st_ui, i, st);
+                        }
+                    }
+                })
+            });
+        }
+
+        if let Some(pos) = swap_at {
+            core.swap(pos);
+            ctx.request_repaint();
         }
 
         card(ui, |ui| {

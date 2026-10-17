@@ -15,16 +15,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: Tests
         run: cargo test --locked
       - name: Release build
         run: cargo build --release --locked
+      - name: Binary size
+        shell: bash
+        run: |
+          f=target/release/brightness-lite; [ -f "$f.exe" ] && f="$f.exe"
+          size=$(wc -c < "$f")
+          echo "$f: $size bytes"
+          echo "### Binary size: $size bytes (\`$f\`)" >> "$GITHUB_STEP_SUMMARY"
       # Memory check: open and hide the window 300 times and print PrivateUsage and
-      # WorkingSetSize at 0, 75, 150 and 300 cycles. Informational only.
+      # WorkingSetSize at 0, 75, 150 and 300 cycles and 3 s after the last hide.
+      # Fails if the 300 cycles do not finish.
       - name: Cycle test (window open/hide x300, memory)
         if: runner.os == 'Windows'
-        continue-on-error: true
         timeout-minutes: 15
         shell: bash
         run: |
@@ -40,3 +53,4 @@ jobs:
             GALLIUM_DRIVER=llvmpipe ./brightness-lite.exe --cycle-test 300 || echo "exit code $?"
             touch cycle-test.log && cat cycle-test.log && summary "Mesa llvmpipe (software OpenGL)" cycle-test.log
           fi
+          grep -q "+3 s idle" cycle-test.log || { echo "cycle test did not finish"; exit 1; }

@@ -1,31 +1,37 @@
 //! Windows shell around the shared logic: tray (tray-icon), hotkeys
 //! (RegisterHotKey), window show/hide (Win32 + DWM cloak) and the egui window.
 
-use crate::{ddc, state::{self, Cmd, Core}, ui};
+use crate::{
+    ddc,
+    state::{self, Cmd, Core},
+    ui,
+};
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
-use std::time::{Duration, Instant};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::ProcessStatus::{EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
-use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::ProcessStatus::{
+    EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+};
+use windows::Win32::System::Threading::{CreateMutexW, GetCurrentProcess};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_DOWN, VK_LBUTTON,
-    VK_MBUTTON, VK_RBUTTON, VK_UP,
+    GetAsyncKeyState, RegisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_DOWN, VK_LBUTTON, VK_MBUTTON, VK_RBUTTON,
+    VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowRect,
-    RegisterClassW, TranslateMessage, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, WINDOW_EX_STYLE,
-    WM_DISPLAYCHANGE, WM_POWERBROADCAST, WNDCLASSW, WS_POPUP, IsWindowVisible, SetForegroundWindow, SetWindowPos,
-    ShowWindow, SystemParametersInfoW, HWND_TOPMOST, MSG, SPI_GETWORKAREA, SW_HIDE, SW_SHOW,
-    SWP_NOSIZE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WM_HOTKEY,
+    BringWindowToTop, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowRect, IsWindowVisible,
+    RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
+    HWND_TOPMOST, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, SPI_GETWORKAREA, SWP_NOSIZE, SW_HIDE, SW_SHOW,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WM_DISPLAYCHANGE, WM_HOTKEY, WM_POWERBROADCAST, WNDCLASSW,
+    WS_POPUP,
 };
 
 const HOTKEY_UP: i32 = 1;
@@ -50,6 +56,8 @@ static PENDING_OPEN: AtomicBool = AtomicBool::new(false);
 /// Just shown: wait for one painted frame, then uncloak.
 static AWAIT_FRAME: AtomicBool = AtomicBool::new(false);
 static UNCLOAK_NOW: AtomicBool = AtomicBool::new(false);
+/// The tray icon could not be made: the window stays open and its close button quits.
+static NO_TRAY: AtomicBool = AtomicBool::new(false);
 /// A tray click that follows a click-away hide must not reopen the window.
 const REOPEN_GUARD: Duration = Duration::from_millis(400);
 /// Safety net: a shown window is uncloaked after this long even without a painted frame.
@@ -141,7 +149,8 @@ fn trim_working_set() {
 fn memory_info() -> Option<(usize, usize)> {
     let mut c = PROCESS_MEMORY_COUNTERS_EX::default();
     let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-    unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut PROCESS_MEMORY_COUNTERS, size) }.ok()?;
+    unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut c as *mut _ as *mut PROCESS_MEMORY_COUNTERS, size) }
+        .ok()?;
     Some((c.PrivateUsage, c.WorkingSetSize))
 }
 
@@ -175,7 +184,12 @@ fn show_window() {
     unsafe {
         let h = hwnd();
         let mut wa = RECT::default();
-        let _ = SystemParametersInfoW(SPI_GETWORKAREA, 0, Some(&mut wa as *mut _ as *mut _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut wa as *mut _ as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
         let mut r = RECT::default();
         let _ = GetWindowRect(h, &mut r);
         let (w, hh) = (r.right - r.left, r.bottom - r.top);
@@ -203,22 +217,14 @@ fn window_visible() -> bool {
 }
 
 fn mouse_button_down() -> bool {
-    unsafe {
-        [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]
-            .iter()
-            .any(|k| (GetAsyncKeyState(k.0 as i32) as u16) & 0x8000 != 0)
-    }
+    unsafe { [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON].iter().any(|k| (GetAsyncKeyState(k.0 as i32) as u16) & 0x8000 != 0) }
 }
 
 fn toggle_window() {
     if window_visible() {
         hide_window();
     } else {
-        let just_hid = FOCUS_HIDE
-            .lock()
-            .ok()
-            .and_then(|g| *g)
-            .is_some_and(|t| t.elapsed() < REOPEN_GUARD);
+        let just_hid = FOCUS_HIDE.lock().ok().and_then(|g| *g).is_some_and(|t| t.elapsed() < REOPEN_GUARD);
         if !just_hid {
             show_window();
         }
@@ -249,6 +255,9 @@ impl eframe::App for BrightnessApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // The close button only hides the window; Quit is in the tray menu.
         if ctx.input(|i| i.viewport().close_requested()) {
+            if NO_TRAY.load(Ordering::Relaxed) {
+                quit(&self.core);
+            }
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             hide_window();
         }
@@ -259,6 +268,9 @@ impl eframe::App for BrightnessApp {
             hide_window(); // also trims once, a moment later
             cloak(false);
             READY.store(true, Ordering::Relaxed);
+            if NO_TRAY.load(Ordering::Relaxed) {
+                show_window(); // nothing else could ever open it
+            }
         }
         if UNCLOAK_NOW.swap(false, Ordering::Relaxed) {
             cloak(false);
@@ -280,7 +292,7 @@ impl eframe::App for BrightnessApp {
         let focused = ctx.input(|i| i.viewport().focused).unwrap_or(false);
         if focused {
             self.armed = true;
-        } else if self.armed && window_visible() {
+        } else if self.armed && window_visible() && !NO_TRAY.load(Ordering::Relaxed) {
             if self.ui.dragging() || mouse_button_down() {
                 ctx.request_repaint_after(Duration::from_millis(50));
             } else {
@@ -326,26 +338,8 @@ impl eframe::App for BrightnessApp {
 
 // ---- tray ----
 
-fn tray_icon_image() -> Icon {
-    // 32x32 blue disc with a lighter centre, drawn in code.
-    let n = 32usize;
-    let mut rgba = vec![0u8; n * n * 4];
-    for y in 0..n {
-        for x in 0..n {
-            let (dx, dy) = (x as f32 + 0.5 - 16.0, y as f32 + 0.5 - 16.0);
-            let d = (dx * dx + dy * dy).sqrt();
-            let px = if d <= 13.0 {
-                if d <= 6.0 { [0xe6, 0xee, 0xff, 0xff] } else { [0x4c, 0x8d, 0xff, 0xff] }
-            } else {
-                [0, 0, 0, 0]
-            };
-            rgba[(y * n + x) * 4..(y * n + x) * 4 + 4].copy_from_slice(&px);
-        }
-    }
-    Icon::from_rgba(rgba, n as u32, n as u32).expect("tray icon")
-}
-
-fn create_tray(core: &Shared) {
+/// Make the tray icon and its menu. False if Windows refused (then the window stays open).
+fn create_tray(core: &Shared) -> bool {
     let menu = Menu::new();
     let open = MenuItem::new("Open", true, None);
     let startup = CheckMenuItem::new(ui::STARTUP_LABEL, true, lock(core).startup, None);
@@ -356,13 +350,14 @@ fn create_tray(core: &Shared) {
     let (open_id, startup_id, rescan_id, quit_id) =
         (open.id().clone(), startup.id().clone(), rescan.id().clone(), quit_item.id().clone());
 
-    let tray = TrayIconBuilder::new()
-        .with_menu(Box::new(menu))
-        .with_menu_on_left_click(false)
-        .with_tooltip("Brightness Lite")
-        .with_icon(tray_icon_image())
-        .build()
-        .expect("tray icon");
+    let mut builder =
+        TrayIconBuilder::new().with_menu(Box::new(menu)).with_menu_on_left_click(false).with_tooltip("Brightness Lite");
+    if let Ok(icon) = Icon::from_rgba(ui::icon_rgba(), 32, 32) {
+        builder = builder.with_icon(icon);
+    }
+    // If the taskbar is not there yet (early at login), tray-icon adds the icon
+    // when it appears. An error here means the tray window itself could not be made.
+    let Ok(tray) = builder.build() else { return false };
     TRAY.with(|t| *t.borrow_mut() = Some(tray));
     STARTUP_ITEM.with(|s| *s.borrow_mut() = Some(startup));
 
@@ -397,6 +392,7 @@ fn create_tray(core: &Shared) {
             quit(&c);
         }
     }));
+    true
 }
 
 // ---- hotkeys: Ctrl+Alt+Up / Down, brightness only ----
@@ -463,8 +459,21 @@ fn start_events(core: Shared) {
             return;
         }
         // Never shown; top-level, so it receives the broadcast messages.
-        if CreateWindowExW(WINDOW_EX_STYLE(0), class, w!("Brightness Lite events"), WS_POPUP, 0, 0, 0, 0, None, None, module, None)
-            .is_err()
+        if CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            class,
+            w!("Brightness Lite events"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            module,
+            None,
+        )
+        .is_err()
         {
             return;
         }
@@ -598,7 +607,10 @@ pub fn run() {
             }
             // eframe shows the window after its first paint; keep that invisible.
             cloak(true);
-            create_tray(&core);
+            if !create_tray(&core) {
+                NO_TRAY.store(true, Ordering::Relaxed);
+                lock(&core).startup_error = "The tray icon could not be made, so the window stays open.".into();
+            }
             start_hotkeys(core.clone());
             start_events(core.clone());
             start_timer();

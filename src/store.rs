@@ -1,9 +1,12 @@
 //! Loads and saves the last brightness and contrast of each monitor as JSON.
-//! Each saved entry carries the monitor's key (its Windows device path), so a
-//! restore goes to the same physical monitor after a restart.
+//! Each saved entry carries the monitor's key (its Windows device path, or its
+//! EDID id on Linux), so a restore goes to the same physical monitor after a restart.
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Values used for a monitor that has no saved value.
 pub const DEFAULT_BRIGHTNESS: u32 = 50;
@@ -30,18 +33,15 @@ impl SavedMonitor {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Default)]
+#[derive(Serialize, Debug, PartialEq, Clone, Default)]
 pub struct Settings {
     /// One entry per monitor ever saved, including ones not connected now.
     /// Files from before keys existed have no such list and load as empty.
-    #[serde(default)]
     pub monitors: Vec<SavedMonitor>,
     /// The user's "Start with Windows" choice. None = never decided (first run: on).
-    #[serde(default)]
     pub autostart: Option<bool>,
     /// The order of the cards in the window, as monitor keys. Monitors not
     /// listed go at the end. Keys of monitors not connected now are kept.
-    #[serde(default)]
     pub order: Vec<String>,
 }
 
@@ -78,24 +78,11 @@ pub fn merged(old: &Settings, current: &[Current]) -> Settings {
     out
 }
 
-/// The new saved order after the connected monitors were put in the order
-/// `shown`. The slots that connected monitors held in `old` are refilled in
-/// the new order, so an unplugged monitor keeps its place for when it comes
-/// back. Connected monitors that were not in `old` go at the end.
-pub fn reordered(old: &[String], shown: &[String]) -> Vec<String> {
-    let mut next = shown.iter().filter(|k| old.contains(k));
-    let mut out: Vec<String> = old
-        .iter()
-        .map(|k| if shown.contains(k) { next.next().unwrap_or(k).clone() } else { k.clone() })
-        .collect();
-    out.extend(shown.iter().filter(|k| !old.contains(k)).cloned());
-    out
-}
-
 /// Argument the autostart entry passes, so a login start can be told apart.
 pub const AUTOSTART_ARG: &str = "--autostart";
 
 /// The "start with Windows" registry value: the full exe path in quotes, then the argument.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn startup_command(exe: &Path) -> String {
     format!("\"{}\" {}", exe.display(), AUTOSTART_ARG)
 }
@@ -118,32 +105,69 @@ pub fn default_path() -> Option<PathBuf> {
 #[cfg_attr(windows, allow(dead_code))]
 pub fn config_base(xdg: Option<std::ffi::OsString>, home: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let xdg = xdg.map(PathBuf::from).filter(|p| p.is_absolute());
-    xdg.or_else(|| {
-        home.map(PathBuf::from).filter(|p| p.is_absolute()).map(|h| h.join(".config"))
-    })
+    xdg.or_else(|| home.map(PathBuf::from).filter(|p| p.is_absolute()).map(|h| h.join(".config")))
 }
 
-/// Missing or corrupt file gives defaults. Never panics.
+/// Read settings from parsed JSON. Each part is checked on its own: a bad
+/// part is dropped, the good parts are kept. Anything else gives defaults.
+fn from_json(v: Value) -> Settings {
+    let Value::Object(map) = v else { return Settings::default() };
+    let list = |name: &str| map.get(name).and_then(Value::as_array).cloned().unwrap_or_default();
+    let mut monitors: Vec<SavedMonitor> = Vec::new();
+    for m in list("monitors").into_iter().filter_map(|e| serde_json::from_value::<SavedMonitor>(e).ok()) {
+        if !m.key.is_empty() && monitors.iter().all(|o| o.key != m.key) {
+            monitors.push(m);
+        }
+    }
+    Settings {
+        monitors,
+        autostart: map.get("autostart").and_then(Value::as_bool),
+        order: crate::order::clean(list("order").into_iter().filter_map(|e| e.as_str().map(String::from))),
+    }
+}
+
+/// Missing, empty or corrupt file gives defaults. Never panics.
 pub fn load(path: &Path) -> Settings {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).map(from_json).unwrap_or_default()
 }
 
-/// Write to a temp file, then rename over the real one, so a crash or power
-/// cut in the middle can never leave a half-written settings file.
-pub fn save(path: &Path, settings: &Settings) -> std::io::Result<()> {
-    // The window thread and the monitor thread both save; one temp file, one writer at a time.
-    static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _guard = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+/// The window thread and the monitor thread both save: one at a time, and a
+/// read-change-write is never split by another save.
+static SAVING: Mutex<()> = Mutex::new(());
+
+/// Write to a temp file, flush it to disk, then rename it over the real one,
+/// so a crash or power cut can never leave a half-written settings file.
+fn write_file(path: &Path, settings: &Settings) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let json = serde_json::to_string_pretty(settings).map_err(std::io::Error::other)?;
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)?;
-    std::fs::rename(&tmp, path)
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(json.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(test)]
+pub fn save(path: &Path, settings: &Settings) -> std::io::Result<()> {
+    let _guard = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    write_file(path, settings)
+}
+
+/// Load, change and save in one step, so two threads can never undo each other's change.
+pub fn update(path: &Path, change: impl FnOnce(&mut Settings)) -> std::io::Result<()> {
+    let _guard = SAVING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut settings = load(path);
+    change(&mut settings);
+    write_file(path, &settings)
 }
 
 #[cfg(test)]
@@ -163,7 +187,10 @@ mod tests {
     #[test]
     fn save_then_load_roundtrip_both_values() {
         let p = temp("roundtrip");
-        let s = Settings { monitors: vec![entry("a", 10, 0), entry("b", 80, 45), entry("c", 100, 100)], ..Default::default() };
+        let s = Settings {
+            monitors: vec![entry("a", 10, 0), entry("b", 80, 45), entry("c", 100, 100)],
+            ..Default::default()
+        };
         save(&p, &s).unwrap();
         assert_eq!(load(&p), s);
     }
@@ -187,7 +214,12 @@ mod tests {
     fn corrupt_file_gives_defaults() {
         let p = temp("corrupt");
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-        for bad in ["{ not json !!", "", "{\"monitors\": \"oops\"}", "{\"monitors\": [{\"key\":\"a\",\"brightness\":-5,\"contrast\":1}]}"] {
+        for bad in [
+            "{ not json !!",
+            "",
+            "{\"monitors\": \"oops\"}",
+            "{\"monitors\": [{\"key\":\"a\",\"brightness\":-5,\"contrast\":1}]}",
+        ] {
             std::fs::write(&p, bad).unwrap();
             assert_eq!(load(&p), Settings::default(), "input: {bad}");
         }
@@ -258,10 +290,7 @@ mod tests {
         let cur = [Current { key: "a", brightness: None, contrast: Some(55) }];
         assert_eq!(merged(&old, &cur).find("a"), Some(&entry("a", 10, 55)));
         let cur = [Current { key: "b", brightness: None, contrast: None }];
-        assert_eq!(
-            merged(&old, &cur).find("b"),
-            Some(&entry("b", DEFAULT_BRIGHTNESS, DEFAULT_CONTRAST))
-        );
+        assert_eq!(merged(&old, &cur).find("b"), Some(&entry("b", DEFAULT_BRIGHTNESS, DEFAULT_CONTRAST)));
     }
 
     #[test]
@@ -279,19 +308,90 @@ mod tests {
         assert_eq!(load(&p).order, Vec::<String>::new());
     }
 
-    fn keys(v: &[&str]) -> Vec<String> {
-        v.iter().map(|s| s.to_string()).collect()
+    #[test]
+    fn bad_parts_are_dropped_good_parts_kept() {
+        let p = temp("lenient");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let text = r#"{
+            "monitors": [
+                {"key": "a", "brightness": 10, "contrast": 20},
+                {"key": "bad", "brightness": -5, "contrast": 1},
+                {"key": "", "brightness": 1, "contrast": 1},
+                {"key": "a", "brightness": 99, "contrast": 99},
+                "junk"
+            ],
+            "autostart": "yes",
+            "order": ["b", "", 7, null, "b", "a"],
+            "unknown": 1
+        }"#;
+        std::fs::write(&p, text).unwrap();
+        let s = load(&p);
+        assert_eq!(s.monitors, vec![entry("a", 10, 20)]);
+        assert_eq!(s.autostart, None);
+        assert_eq!(s.order, vec!["b", "a"]);
+        // An order that is not a list is ignored, the rest still loads.
+        std::fs::write(&p, r#"{"monitors": [{"key": "a", "brightness": 1, "contrast": 2}], "order": "a"}"#).unwrap();
+        assert_eq!(load(&p).monitors.len(), 1);
+        assert!(load(&p).order.is_empty());
     }
 
     #[test]
-    fn reordered_keeps_place_of_unplugged_and_appends_new() {
-        // Nothing saved yet: the shown order is taken as is.
-        assert_eq!(reordered(&[], &keys(&["b", "a"])), keys(&["b", "a"]));
-        // "a" is unplugged; b and c are swapped; "a" keeps the first place.
-        assert_eq!(reordered(&keys(&["a", "b", "c"]), &keys(&["c", "b"])), keys(&["a", "c", "b"]));
-        // A monitor never seen before goes at the end.
-        assert_eq!(reordered(&keys(&["a", "b"]), &keys(&["b", "a", "n"])), keys(&["b", "a", "n"]));
-        assert_eq!(reordered(&keys(&["a", "b"]), &keys(&["n", "b"])), keys(&["a", "b", "n"]));
+    fn files_written_by_0_2_load_unchanged() {
+        let p = temp("v02");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        // A file in the 0.2.3 format from Windows (JSON escapes each backslash of the key).
+        let text = r#"{
+  "monitors": [
+    {
+      "key": "\\\\?\\display#del40e5#5&2a5c7f4d&0&uid4352#{e6f07b5f}",
+      "brightness": 40,
+      "contrast": 75
+    }
+  ],
+  "autostart": true,
+  "order": [
+    "x",
+    "\\\\?\\display#del40e5#5&2a5c7f4d&0&uid4352#{e6f07b5f}"
+  ]
+}"#;
+        std::fs::write(&p, text).unwrap();
+        let s = load(&p);
+        let key = r"\\?\display#del40e5#5&2a5c7f4d&0&uid4352#{e6f07b5f}";
+        assert_eq!(s.monitors, vec![entry(key, 40, 75)]);
+        assert_eq!(s.autostart, Some(true));
+        assert_eq!(s.order, vec!["x", key]);
+        // Saving writes the same format back.
+        save(&p, &s).unwrap();
+        assert_eq!(load(&p), s);
+    }
+
+    #[test]
+    fn update_keeps_changes_from_other_threads() {
+        let p = temp("update");
+        let threads: Vec<_> = (0..8)
+            .map(|n| {
+                let p = p.clone();
+                std::thread::spawn(move || {
+                    for i in 0..10 {
+                        update(&p, |s| s.order.push(format!("t{n}-{i}"))).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert_eq!(load(&p).order.len(), 80);
+        assert!(!p.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn save_into_a_folder_that_cannot_be_made_fails_without_panic() {
+        let p = temp("blocked");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        let file = p.parent().unwrap().join("file");
+        std::fs::write(&file, "x").unwrap();
+        assert!(save(&file.join("settings.json"), &Settings::default()).is_err());
     }
 
     #[cfg(not(windows))]

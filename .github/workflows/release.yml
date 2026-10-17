@@ -7,7 +7,7 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
-    paths-ignore: ["README.md", "REPORT.md", "LICENSE"]
+    paths-ignore: ["README.md", "LICENSE"]
   workflow_dispatch:
 
 permissions:
@@ -83,6 +83,7 @@ jobs:
     needs: [check, windows, linux]
     runs-on: ubuntu-22.04
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -108,6 +109,9 @@ jobs:
           `SHA256SUMS.txt` has the checksums of both files.
 
           NOTES
+          # The part of CHANGELOG.md for this version, if there is one.
+          awk -v v="## $VERSION" '$0 == v || index($0, v " ") == 1 {on=1; next} /^## /{on=0} on' CHANGELOG.md >> notes.md
+          echo "File sizes: $(cd dist && wc -c brightness-lite-windows-x64.exe brightness-lite-linux-x64.tar.gz | head -2 | awk '{printf "%s %s bytes. ", $2, $1}')" >> notes.md
           gh release create "v$VERSION" dist/* \
             --target "$SHA" \
             --title "Brightness Lite $VERSION" \

@@ -16,9 +16,8 @@ mod windows_impl {
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW,
-        RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE,
-        REG_OPTION_NON_VOLATILE, REG_SZ,
+        RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+        HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
     };
 
     const RUN_KEY: PCWSTR = w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run");
@@ -150,10 +149,7 @@ mod windows_impl {
             assert_eq!(read_run_value(&name), None);
 
             set_entry(&name, true, exe).unwrap();
-            assert_eq!(
-                read_run_value(&name).as_deref(),
-                Some("\"C:\\Tools\\brightness-lite.exe\" --autostart")
-            );
+            assert_eq!(read_run_value(&name).as_deref(), Some("\"C:\\Tools\\brightness-lite.exe\" --autostart"));
 
             set_entry(&name, false, exe).unwrap();
             assert_eq!(read_run_value(&name), None);
@@ -166,10 +162,7 @@ mod windows_impl {
             let name = test_name("moved");
             set_entry(&name, true, Path::new("C:\\Old\\brightness-lite.exe")).unwrap();
             refresh_entry(&name, Path::new("C:\\New dir\\brightness-lite.exe")).unwrap();
-            assert_eq!(
-                read_run_value(&name).as_deref(),
-                Some("\"C:\\New dir\\brightness-lite.exe\" --autostart")
-            );
+            assert_eq!(read_run_value(&name).as_deref(), Some("\"C:\\New dir\\brightness-lite.exe\" --autostart"));
             set_entry(&name, false, Path::new("x")).unwrap();
             assert_eq!(read_run_value(&name), None);
         }
