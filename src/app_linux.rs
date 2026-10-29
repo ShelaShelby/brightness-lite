@@ -42,6 +42,39 @@ const PANEL_GAP: f32 = 40.0;
 /// Window height set in run().
 const WINDOW_H: f32 = 150.0 + 165.0;
 
+// ---- debug log: BRIGHTNESS_LITE_DEBUG=1 writes what the window does to stderr ----
+
+/// Read once, on the first log call. Unset (or anything but "1") means no logging.
+static DEBUG: OnceLock<bool> = OnceLock::new();
+/// Time zero for the log lines.
+static DEBUG_START: OnceLock<Instant> = OnceLock::new();
+
+fn debug_on() -> bool {
+    *DEBUG.get_or_init(|| std::env::var_os("BRIGHTNESS_LITE_DEBUG").is_some_and(|v| v == "1"))
+}
+
+/// One log line: seconds since start, wall-clock time, thread, message.
+fn debug_line(msg: std::fmt::Arguments) {
+    let start = *DEBUG_START.get_or_init(Instant::now);
+    let t = start.elapsed();
+    let wall = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let (h, m, s, ms) =
+        ((wall.as_secs() / 3600) % 24, (wall.as_secs() / 60) % 60, wall.as_secs() % 60, wall.subsec_millis());
+    let thread = std::thread::current();
+    let name = thread.name().map_or_else(|| format!("{:?}", thread.id()), str::to_owned);
+    eprintln!("[{:>8.3}s {h:02}:{m:02}:{s:02}.{ms:03} UTC {name}] {msg}", t.as_secs_f64());
+}
+
+/// Like eprintln!, but only with BRIGHTNESS_LITE_DEBUG=1. Arguments are not
+/// even formatted when logging is off.
+macro_rules! debug {
+    ($($arg:tt)*) => {
+        if debug_on() {
+            debug_line(format_args!($($arg)*));
+        }
+    };
+}
+
 fn lock(core: &Shared) -> MutexGuard<'_, Core> {
     core.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -53,11 +86,13 @@ fn repaint() {
 }
 
 fn request_show() {
+    debug!("request_show");
     SHOW_REQ.store(true, Ordering::Relaxed);
     repaint();
 }
 
 fn request_toggle() {
+    debug!("request_toggle");
     TOGGLE_REQ.store(true, Ordering::Relaxed);
     repaint();
 }
@@ -98,6 +133,7 @@ impl ksni::Tray for BrightnessTray {
     }
 
     fn activate(&mut self, x: i32, y: i32) {
+        debug!("tray activate x={x} y={y}");
         if let Ok(mut g) = CLICK_POS.lock() {
             *g = Some((x, y));
         }
@@ -106,7 +142,15 @@ impl ksni::Tray for BrightnessTray {
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
         vec![
-            StandardItem { label: "Open".into(), activate: Box::new(|_| request_show()), ..Default::default() }.into(),
+            StandardItem {
+                label: "Open".into(),
+                activate: Box::new(|_| {
+                    debug!("tray menu: Open");
+                    request_show()
+                }),
+                ..Default::default()
+            }
+            .into(),
             CheckmarkItem {
                 label: ui::STARTUP_LABEL.into(),
                 checked: self.startup,
@@ -347,10 +391,13 @@ struct BrightnessApp {
     /// True once the window has had focus since it was opened.
     armed: bool,
     first_hide_done: bool,
+    /// Last focus state written to the debug log (outer None = nothing logged yet).
+    last_focus: Option<Option<bool>>,
 }
 
 impl BrightnessApp {
-    fn show(&mut self, ctx: &egui::Context) {
+    fn show(&mut self, ctx: &egui::Context, reason: &str) {
+        debug!("show() reason={reason}");
         // Opened from a tray click: put the window just above the icon.
         // Some hosts send (0, 0), which means "unknown". The menu stores nothing.
         let click = CLICK_POS.lock().ok().and_then(|mut g| g.take()).filter(|&p| p != (0, 0));
@@ -362,8 +409,12 @@ impl BrightnessApp {
             let size = size.map_or((ui::WINDOW_W, WINDOW_H), |s| (s.x, s.y));
             // The tray sends pixels, egui positions windows in points.
             let (px, py) = popup_pos((x as f32 / ppp, y as f32 / ppp), size, PANEL_GAP);
+            debug!("OuterPosition ({px}, {py}) points; click=({x}, {y}) px, scale={ppp}, size={size:?}");
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(px, py)));
+        } else {
+            debug!("no OuterPosition: no usable click position");
         }
+        debug!("send Visible(true), Focus");
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         VISIBLE.store(true, Ordering::Relaxed);
@@ -372,7 +423,8 @@ impl BrightnessApp {
         ctx.request_repaint();
     }
 
-    fn hide(&mut self, ctx: &egui::Context) {
+    fn hide(&mut self, ctx: &egui::Context, reason: &str) {
+        debug!("hide() reason={reason}");
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         VISIBLE.store(false, Ordering::Relaxed);
     }
@@ -382,12 +434,20 @@ impl eframe::App for BrightnessApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let tray = TRAY_OK.load(Ordering::Relaxed);
 
+        if debug_on() {
+            let focused = ctx.input(|i| i.viewport().focused);
+            if self.last_focus != Some(focused) {
+                debug!("focus changed: {:?} -> {focused:?}", self.last_focus.flatten());
+                self.last_focus = Some(focused);
+            }
+        }
+
         // The close button only hides the window (Quit is in the tray menu).
         // Without a tray there is nothing to bring it back, so it quits.
         if ctx.input(|i| i.viewport().close_requested()) {
             if tray {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-                self.hide(ctx);
+                self.hide(ctx, "close button");
             } else {
                 quit(&self.core);
             }
@@ -397,7 +457,7 @@ impl eframe::App for BrightnessApp {
         if !self.first_hide_done && FIRST_FRAME.load(Ordering::Relaxed) {
             self.first_hide_done = true;
             if tray {
-                self.hide(ctx);
+                self.hide(ctx, "startup (first frame painted)");
             } else {
                 VISIBLE.store(true, Ordering::Relaxed);
             }
@@ -405,17 +465,24 @@ impl eframe::App for BrightnessApp {
 
         if self.first_hide_done {
             if TOGGLE_REQ.swap(false, Ordering::Relaxed) {
-                if VISIBLE.load(Ordering::Relaxed) {
-                    self.hide(ctx);
+                let visible = VISIBLE.load(Ordering::Relaxed);
+                debug!("toggle request taken, visible={visible}");
+                if visible {
+                    self.hide(ctx, "toggle");
                 } else {
-                    let just_hid = FOCUS_HIDE.lock().ok().and_then(|g| *g).is_some_and(|t| t.elapsed() < REOPEN_GUARD);
+                    let since = FOCUS_HIDE.lock().ok().and_then(|g| *g).map(|t| t.elapsed());
+                    let just_hid = since.is_some_and(|d| d < REOPEN_GUARD);
+                    debug!(
+                        "REOPEN_GUARD check: since click-away hide={since:?}, guard={REOPEN_GUARD:?}, blocked={just_hid}"
+                    );
                     if !just_hid {
-                        self.show(ctx);
+                        self.show(ctx, "toggle");
                     }
                 }
             }
             if SHOW_REQ.swap(false, Ordering::Relaxed) {
-                self.show(ctx);
+                debug!("show request taken");
+                self.show(ctx, "menu Open");
             }
         }
 
@@ -432,7 +499,7 @@ impl eframe::App for BrightnessApp {
                     if let Ok(mut g) = FOCUS_HIDE.lock() {
                         *g = Some(Instant::now());
                     }
-                    self.hide(ctx);
+                    self.hide(ctx, "click-away (focus lost)");
                 }
             }
         }
@@ -471,12 +538,16 @@ pub fn run() {
 
     // A second copy exits quietly.
     let Some(_instance) = single_instance(&lock_path()) else {
+        debug!("another copy is already running, exiting");
         return;
     };
+
+    debug!("start, version {}, DISPLAY={:?}", env!("CARGO_PKG_VERSION"), std::env::var_os("DISPLAY"));
 
     let core: Shared = state::start(repaint);
     let tray_ok = start_tray(&core);
     TRAY_OK.store(tray_ok, Ordering::Relaxed);
+    debug!("tray started: {tray_ok}");
     if !tray_ok {
         lock(&core).startup_error =
             "No system tray found, so the window stays open. Install a StatusNotifier/AppIndicator host to get the tray icon.".into();
@@ -510,6 +581,7 @@ pub fn run() {
                 ui: ui::UiState::default(),
                 armed: false,
                 first_hide_done: false,
+                last_focus: None,
             }))
         }),
     );

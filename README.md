@@ -65,6 +65,9 @@ Good to know on Linux:
 - If the app does not start, install the keyboard library. On Ubuntu or
   Debian: `sudo apt install libxkbcommon-x11-0`.
 - Monitors on NVIDIA's own driver may not be found.
+- Debug log: quit the app from the tray menu, then start it from a terminal
+  with `BRIGHTNESS_LITE_DEBUG=1 ./brightness-lite 2> brightness-lite.log`.
+  The file then lists every tray click, open, hide and focus change.
 
 ## Update
 

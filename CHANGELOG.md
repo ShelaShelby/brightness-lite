@@ -2,6 +2,15 @@
 
 What changed in each version, newest first.
 
+## 0.3.4
+
+New:
+
+- Linux: debug log. Start the app with `BRIGHTNESS_LITE_DEBUG=1` and it
+  writes timestamped lines to stderr for tray clicks, opening and hiding
+  (with the reason), focus changes, the reopen guard and the window position.
+  Without the variable nothing is logged.
+
 ## 0.3.3
 
 Fixes:
