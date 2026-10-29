@@ -2,6 +2,12 @@
 
 What changed in each version, newest first.
 
+## 0.3.3
+
+Fixes:
+
+- Linux: the window opens above the tray icon, like on Windows.
+
 ## 0.3.2
 
 Fixes:

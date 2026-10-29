@@ -35,6 +35,12 @@ static TRAY_STARTUP: AtomicBool = AtomicBool::new(false);
 static FOCUS_HIDE: Mutex<Option<Instant>> = Mutex::new(None);
 /// A tray click that follows a click-away hide must not reopen the window.
 const REOPEN_GUARD: Duration = Duration::from_millis(400);
+/// Where the tray icon was last clicked, in screen pixels.
+static CLICK_POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// Gap between the window's bottom edge and the click, so it clears the panel.
+const PANEL_GAP: f32 = 40.0;
+/// Window height set in run().
+const WINDOW_H: f32 = 150.0 + 165.0;
 
 fn lock(core: &Shared) -> MutexGuard<'_, Core> {
     core.lock().unwrap_or_else(|e| e.into_inner())
@@ -91,7 +97,10 @@ impl ksni::Tray for BrightnessTray {
         vec![ksni::Icon { width: 32, height: 32, data: rgba_to_argb(&ui::icon_rgba()) }]
     }
 
-    fn activate(&mut self, _x: i32, _y: i32) {
+    fn activate(&mut self, x: i32, y: i32) {
+        if let Ok(mut g) = CLICK_POS.lock() {
+            *g = Some((x, y));
+        }
         request_toggle();
     }
 
@@ -314,6 +323,14 @@ fn single_instance(path: &Path) -> Option<File> {
     }
 }
 
+/// Top-left corner for a window of `size` so it is centred on `click` and its
+/// bottom edge sits `gap` above it. Never above or left of the screen.
+fn popup_pos(click: (f32, f32), size: (f32, f32), gap: f32) -> (f32, f32) {
+    let x = click.0 - size.0 / 2.0;
+    let y = click.1 - gap - size.1;
+    (x.max(0.0), y.max(0.0))
+}
+
 fn lock_path() -> PathBuf {
     let uid = unsafe { libc::getuid() };
     match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|p| p.is_absolute()) {
@@ -334,6 +351,19 @@ struct BrightnessApp {
 
 impl BrightnessApp {
     fn show(&mut self, ctx: &egui::Context) {
+        // Opened from a tray click: put the window just above the icon.
+        // Some hosts send (0, 0), which means "unknown". The menu stores nothing.
+        let click = CLICK_POS.lock().ok().and_then(|mut g| g.take()).filter(|&p| p != (0, 0));
+        if let Some((x, y)) = click {
+            let (size, ppp) = ctx.input(|i| {
+                let v = i.viewport();
+                (v.outer_rect.map(|r| r.size()), v.native_pixels_per_point.unwrap_or(1.0))
+            });
+            let size = size.map_or((ui::WINDOW_W, WINDOW_H), |s| (s.x, s.y));
+            // The tray sends pixels, egui positions windows in points.
+            let (px, py) = popup_pos((x as f32 / ppp, y as f32 / ppp), size, PANEL_GAP);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(px, py)));
+        }
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         VISIBLE.store(true, Ordering::Relaxed);
@@ -454,12 +484,11 @@ pub fn run() {
     start_hotkeys(core.clone());
     start_hotplug(core.clone());
 
-    let height = 150.0 + 165.0;
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Brightness Lite")
             .with_app_id("brightness-lite")
-            .with_inner_size([ui::WINDOW_W, height])
+            .with_inner_size([ui::WINDOW_W, WINDOW_H])
             .with_resizable(false)
             .with_maximize_button(false)
             .with_minimize_button(false)
@@ -533,6 +562,23 @@ mod tests {
         assert!(hotkey_blocker(None, true).is_some());
         assert!(hotkey_blocker(Some("x11"), false).is_none());
         assert!(hotkey_blocker(None, false).is_none());
+    }
+
+    #[test]
+    fn popup_sits_above_the_click() {
+        // Centred on the click, bottom edge 40 above it.
+        assert_eq!(popup_pos((1000.0, 1060.0), (300.0, 315.0), 40.0), (850.0, 705.0));
+    }
+
+    #[test]
+    fn popup_stays_on_screen_near_the_left_edge() {
+        assert_eq!(popup_pos((50.0, 1060.0), (300.0, 315.0), 40.0), (0.0, 705.0));
+    }
+
+    #[test]
+    fn popup_stays_on_screen_near_the_top() {
+        // A panel at the top of the screen: the window cannot go above y = 0.
+        assert_eq!(popup_pos((1000.0, 20.0), (300.0, 315.0), 40.0), (850.0, 0.0));
     }
 
     #[test]
