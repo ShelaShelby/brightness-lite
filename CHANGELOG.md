@@ -2,6 +2,12 @@
 
 What changed in each version, newest first.
 
+## 0.3.2
+
+Fixes:
+
+- Linux: on Wayland desktops the app now runs through XWayland, so opening from the tray, click-away hiding and always-on-top work like on Windows.
+
 ## 0.3.1
 
 Fixes:

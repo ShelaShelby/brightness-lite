@@ -432,6 +432,13 @@ impl eframe::App for BrightnessApp {
 }
 
 pub fn run() {
+    // On Wayland, winit ignores focus, hide/show, always-on-top and skip-taskbar,
+    // so the tray toggle and click-away hiding break. If XWayland is there, use X11.
+    // This must run before any thread starts: changing the environment is not thread-safe.
+    if std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty()) {
+        std::env::remove_var("WAYLAND_DISPLAY");
+    }
+
     // A second copy exits quietly.
     let Some(_instance) = single_instance(&lock_path()) else {
         return;
