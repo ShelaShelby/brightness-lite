@@ -2,6 +2,12 @@
 
 What changed in each version, newest first.
 
+## 0.3.1
+
+Fixes:
+
+- Linux: DisplayPort monitors on AMD (and Intel) now use the DP AUX I2C bus, so brightness and contrast work.
+
 ## 0.3.0
 
 The last planned version: fixes and polish only, no new features.

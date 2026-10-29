@@ -258,6 +258,12 @@ fn unique_keys(items: &[(Option<String>, String)]) -> Vec<String> {
         .collect()
 }
 
+/// The I2C bus inside a connector's folder (".../card1-DP-1/i2c-8" -> 8).
+/// The lowest number wins if there is more than one.
+fn aux_bus(connector_dir: &Path) -> Option<u32> {
+    fs::read_dir(connector_dir).ok()?.flatten().filter_map(|e| bus_number(&e.file_name().to_string_lossy())).min()
+}
+
 fn list_connectors(drm: &Path) -> Vec<Connector> {
     let mut out = Vec::new();
     let Ok(rd) = fs::read_dir(drm) else { return out };
@@ -273,7 +279,11 @@ fn list_connectors(drm: &Path) -> Vec<Connector> {
             continue;
         }
         let data = fs::read(dir.join("edid")).ok().filter(|d| edid::parse(d).is_some());
-        let bus = fs::read_link(dir.join("ddc")).ok().and_then(|l| bus_number(&l.to_string_lossy()));
+        // DisplayPort: DDC/CI goes over the AUX channel, whose I2C bus is a
+        // subfolder of the connector (amdgpu, i915). The `ddc` link can point to
+        // a different bus that reads the EDID but never answers DDC/CI.
+        let bus = aux_bus(&dir)
+            .or_else(|| fs::read_link(dir.join("ddc")).ok().and_then(|l| bus_number(&l.to_string_lossy())));
         out.push(Connector { name, edid: data, bus });
     }
     out.sort_by_key(|c| natural_key(&c.name));
@@ -449,6 +459,24 @@ mod tests {
         assert_eq!(edid::parse(found[0].edid.as_deref().unwrap()).unwrap().display_name(), "DELL U2720Q");
         assert_eq!(found[1].bus, None);
         assert!(found[1].edid.is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn displayport_aux_bus_wins_over_the_ddc_link() {
+        // amdgpu: card1-DP-1/ddc -> i2c-4 (reads the EDID, no DDC/CI over DP),
+        // card1-DP-1/i2c-8 is the AUX bus that answers.
+        let root = std::env::temp_dir().join(format!("bl-drm-aux-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let d = root.join("card1-DP-1");
+        fs::create_dir_all(d.join("i2c-8")).unwrap();
+        fs::write(d.join("status"), "connected\n").unwrap();
+        fs::create_dir_all(root.join("i2c-4")).unwrap();
+        std::os::unix::fs::symlink("../i2c-4", d.join("ddc")).unwrap();
+
+        let found = list_connectors(&root);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].bus, Some(8));
         let _ = fs::remove_dir_all(&root);
     }
 }
