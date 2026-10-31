@@ -10,3 +10,4 @@ settings.json
 .env
 .vscode/
 .idea/
+theme.json
