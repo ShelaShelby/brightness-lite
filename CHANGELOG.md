@@ -2,6 +2,26 @@
 
 What changed in each version, newest first.
 
+## Unreleased
+
+### New
+
+- Theme panel: a palette button at the top right of the window opens
+  Appearance (Light, Dark, AMOLED) and Colour (seven accent colours).
+  Changes apply at once and are saved in `theme.json` next to the exe,
+  shared with Audio Lite (read again each time the window opens).
+- All colours of the window come from one set of named colours (three
+  palettes); Dark is the look from before.
+- The window title bar follows the appearance (light or dark).
+
+### Tests
+
+- Unit tests for all 21 appearance x colour combinations, broken, locked
+  and read-only theme files, interrupted and simultaneous saves.
+- Headless tests that click, drag and tab through the real window.
+- CI: `--theme-test N [IDLE_S]` stress test (panel, appearance, colour,
+  show/hide; memory, handles, GDI and USER objects, idle CPU).
+
 ## 0.3.4
 
 New:

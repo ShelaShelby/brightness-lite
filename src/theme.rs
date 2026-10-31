@@ -257,16 +257,15 @@ fn temp_path(path: &Path) -> PathBuf {
     PathBuf::from(tmp)
 }
 
-/// Write a temporary file, flush it to disk, then rename it over theme.json.
-/// A crash, a full disk or the other app saving at the same time leaves
-/// either the old file or the new one, never half a file.
+/// Write a temporary file, then rename it over theme.json. A crash, a full
+/// disk or the other app saving at the same time leaves either the old file
+/// or the new one, never half a file. No flush to disk: it would make a click
+/// wait for the disk, and the worst a power cut can do is an empty file,
+/// which reads as Dark + Blue.
 pub fn save(path: &Path, t: Theme) -> std::io::Result<()> {
     use std::io::Write;
     let tmp = temp_path(path);
-    let written = std::fs::File::create(&tmp).and_then(|mut f| {
-        f.write_all(to_json(t).as_bytes())?;
-        f.sync_all()
-    });
+    let written = std::fs::File::create(&tmp).and_then(|mut f| f.write_all(to_json(t).as_bytes()));
     let res = written.and_then(|()| std::fs::rename(&tmp, path));
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);

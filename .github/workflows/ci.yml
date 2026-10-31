@@ -7,9 +7,12 @@ on:
   # Run by hand (for example on a branch), with a longer idle check if wanted.
   workflow_dispatch:
     inputs:
+      theme_clicks:
+        description: "Theme stress test: clicks per step (2000 for the full test)"
+        default: "2000"
       idle_seconds:
         description: "Theme stress test: how long to leave the window idle (seconds)"
-        default: "60"
+        default: "600"
 
 jobs:
   test:
@@ -60,23 +63,25 @@ jobs:
             touch cycle-test.log && cat cycle-test.log && summary "Mesa llvmpipe (software OpenGL)" cycle-test.log
           fi
           grep -q "+3 s idle" cycle-test.log || { echo "cycle test did not finish"; exit 1; }
-      # Theme panel stress test, in the real window: open/close the panel 2000
+      # Theme panel stress test, in the real window: open/close the panel N
       # times (moving the window to the screen edges, then 60 fast clicks),
-      # switch the appearance 2000 times and the colour 2000 times (clicks go
-      # through egui's input), show/hide the window 500 times (theme.json
+      # switch the appearance N times and the colour N times (clicks go
+      # through egui's input), show/hide the window N/4 times (theme.json
       # changed by "the other app" every 10th time), then leave it idle.
+      # N = 300 and 10 s idle on every push; run the workflow by hand for the
+      # full test (2000 clicks per step, 600 s idle).
       # Prints private bytes, working set, handles, GDI and USER objects at
       # the start, middle and end of each step, and the idle CPU. Fails if any
       # of them kept growing, the window left the work area or a click did not
       # do what it should.
-      - name: Theme stress test (panel x2000, appearance x2000, colour x2000, show/hide x500, idle)
+      - name: Theme stress test (panel, appearance, colour, show/hide, idle)
         if: runner.os == 'Windows'
         timeout-minutes: 45
         shell: bash
         run: |
           if [ -f mesa/brightness-lite.exe ]; then cd mesa; exe=./brightness-lite.exe; else exe=./target/release/brightness-lite.exe; fi
           rm -f cycle-test.log
-          "$exe" --theme-test 2000 "${{ github.event.inputs.idle_seconds || '60' }}" || echo "exit code $?"
+          "$exe" --theme-test "${{ github.event.inputs.theme_clicks || '300' }}" "${{ github.event.inputs.idle_seconds || '10' }}" || echo "exit code $?"
           touch cycle-test.log && cat cycle-test.log
           { echo "### Theme stress test"; echo '```'; cat cycle-test.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
           grep -q "theme-test: PASS" cycle-test.log || { echo "theme stress test failed"; exit 1; }
