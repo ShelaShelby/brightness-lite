@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, claude/theme-panel-lite-apps-jcwkn8]  # TEMP: CI on the work branch while testing
+    branches: [main]
   pull_request:
   # Run by hand (for example on a branch), with a longer idle check if wanted.
   workflow_dispatch:
