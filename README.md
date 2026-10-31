@@ -113,7 +113,9 @@ it. The panel is always closed when the window opens.
 Changes apply at once. If the window would no longer fit above the
 taskbar, it grows upward instead.
 
-The choice is saved in `theme.json` next to the exe:
+The choice is saved in `theme.json` in your user folder,
+`%APPDATA%\Lite Apps\theme.json` (on Linux `~/.config/lite-apps/theme.json`),
+not next to the exe:
 
 ```json
 {
@@ -122,8 +124,7 @@ The choice is saved in `theme.json` next to the exe:
 }
 ```
 
-[Audio Lite](https://github.com/ShelaShelby/Audio-Lite) reads and writes the same file, so if both exes are in the same
-folder they share one theme: change it in one, and the other uses it the
+[Audio Lite](https://github.com/ShelaShelby/Audio-Lite) reads and writes the same file, so both apps share one theme: change it in one, and the other uses it the
 next time its window opens. If the file is missing or broken, Dark + Blue
 is used. The file is only written when you pick something, never read or
 written over the network, and "Reset to saved values" does not change it.

@@ -598,7 +598,9 @@ pub fn run() {
         options,
         Box::new(move |cc| {
             ui::apply_theme(&cc.egui_ctx);
-            let theme_path = std::env::current_exe().ok().and_then(|p| theme::path_in(p.parent()));
+            let theme_path = theme::default_path();
+            let old = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join(theme::FILE_NAME)));
+            theme::move_old_file(old.as_deref(), theme_path.as_deref());
             let ui_state = ui::UiState::new(theme::Store::open(theme_path));
             ui_state.apply(&cc.egui_ctx);
             let _ = CTX.set(cc.egui_ctx.clone());

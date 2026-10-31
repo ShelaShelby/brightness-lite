@@ -2,6 +2,15 @@
 
 What changed in each version, newest first.
 
+## 0.4.1
+
+Fixes:
+
+- `theme.json` is no longer written next to the exe. It is now kept in
+  `%APPDATA%\Lite Apps\theme.json` (Linux: `~/.config/lite-apps/`), shared
+  by Brightness Lite and Audio Lite. A `theme.json` left next to the exe by
+  the previous version is moved there and deleted.
+
 ## 0.4.0
 
 ### New

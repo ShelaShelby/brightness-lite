@@ -223,9 +223,43 @@ pub fn to_json(t: Theme) -> String {
     format!("{{\n  \"appearance\": \"{}\",\n  \"accent\": \"{}\"\n}}\n", t.appearance.key(), t.accent.key())
 }
 
-/// theme.json in the exe's folder.
-pub fn path_in(exe_dir: Option<&Path>) -> Option<PathBuf> {
-    exe_dir.map(|d| d.join(FILE_NAME))
+/// The folder both apps keep theme.json in, under the per-user config folder.
+pub const SHARED_DIR: &str = if cfg!(windows) { "Lite Apps" } else { "lite-apps" };
+
+/// theme.json in the shared folder under `config` (%APPDATA% on Windows,
+/// $XDG_CONFIG_HOME or ~/.config on Linux).
+pub fn path_under(config: Option<&Path>) -> Option<PathBuf> {
+    config.map(|c| c.join(SHARED_DIR).join(FILE_NAME))
+}
+
+/// Where theme.json lives for this user.
+pub fn default_path() -> Option<PathBuf> {
+    let config = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from).filter(|p| p.is_absolute())
+    } else {
+        let xdg = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).filter(|p| p.is_absolute());
+        xdg.or_else(|| {
+            std::env::var_os("HOME").map(PathBuf::from).filter(|p| p.is_absolute()).map(|h| h.join(".config"))
+        })
+    };
+    path_under(config.as_deref())
+}
+
+/// Brightness Lite 0.4.0 and Audio Lite 0.5.0 kept theme.json next to the exe.
+/// If one is there, its theme moves to `new` (unless `new` already has one)
+/// and the old file is deleted. Called once at start-up; costs one look for the file.
+pub fn move_old_file(old: Option<&Path>, new: Option<&Path>) {
+    let (Some(old), Some(new)) = (old, new) else { return };
+    if old == new || !old.is_file() {
+        return;
+    }
+    if !new.exists() {
+        let Some(t) = read(Some(old)) else { return };
+        if save(new, t).is_err() {
+            return; // keep the old file: it is the only copy
+        }
+    }
+    let _ = std::fs::remove_file(old);
 }
 
 /// The theme in the file. A missing file gives Dark + Blue. `None`: the file is
@@ -264,6 +298,9 @@ fn temp_path(path: &Path) -> PathBuf {
 /// which reads as Dark + Blue.
 pub fn save(path: &Path, t: Theme) -> std::io::Result<()> {
     use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let tmp = temp_path(path);
     let written = std::fs::File::create(&tmp).and_then(|mut f| f.write_all(to_json(t).as_bytes()));
     let res = written.and_then(|()| std::fs::rename(&tmp, path));
@@ -710,15 +747,57 @@ mod tests {
     }
 
     #[test]
-    fn path_is_next_to_the_exe() {
-        let exe_dir = Path::new("C:\\Tools");
-        assert_eq!(path_in(Some(exe_dir)), Some(exe_dir.join("theme.json")));
-        assert_eq!(path_in(None), None);
+    fn path_is_in_the_shared_folder() {
+        let appdata = Path::new("C:\\Users\\a\\AppData\\Roaming");
+        assert_eq!(path_under(Some(appdata)), Some(appdata.join(SHARED_DIR).join("theme.json")));
+        assert_eq!(path_under(None), None);
+        assert!(default_path().is_none_or(|p| p.ends_with(Path::new(SHARED_DIR).join(FILE_NAME))));
         // No path (exe folder unknown): Dark + Blue, choices are kept in memory only.
         let mut s = Store::open(None);
         assert_eq!(s.theme, Theme::default());
         assert!(s.set(Theme { appearance: Appearance::Light, accent: Accent::Red }));
         assert!(!s.reload());
+    }
+
+    /// The folder is made on the first save; reading before that gives Dark + Blue.
+    #[test]
+    fn first_save_makes_the_folder() {
+        let d = dir("mkdir");
+        let p = path_under(Some(&d)).unwrap();
+        assert_eq!(read(Some(&p)), Some(Theme::default()));
+        let t = Theme { appearance: Appearance::Light, accent: Accent::Teal };
+        save(&p, t).unwrap();
+        assert_eq!(read(Some(&p)), Some(t));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A theme.json next to the exe (0.4.0 / 0.5.0) moves to the shared folder and is deleted.
+    #[test]
+    fn old_file_next_to_the_exe_is_moved() {
+        let d = dir("move");
+        let exe_dir = d.join("Tools");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let old = exe_dir.join(FILE_NAME);
+        let new = path_under(Some(&d.join("AppData"))).unwrap();
+        let t = Theme { appearance: Appearance::Amoled, accent: Accent::Pink };
+        save(&old, t).unwrap();
+        move_old_file(Some(&old), Some(&new));
+        assert!(!old.exists(), "the old file is gone");
+        assert_eq!(read(Some(&new)), Some(t), "its theme was kept");
+        // The second app finds nothing to move.
+        move_old_file(Some(&old), Some(&new));
+        assert_eq!(read(Some(&new)), Some(t));
+        // The shared file wins over an old one (the other app moved its own first).
+        let other = Theme { appearance: Appearance::Light, accent: Accent::Red };
+        save(&old, other).unwrap();
+        move_old_file(Some(&old), Some(&new));
+        assert!(!old.exists());
+        assert_eq!(read(Some(&new)), Some(t));
+        // Nothing to do without a path, or when both are the same file.
+        move_old_file(None, Some(&new));
+        move_old_file(Some(&new), Some(&new));
+        assert_eq!(read(Some(&new)), Some(t));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
