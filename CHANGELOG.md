@@ -2,7 +2,7 @@
 
 What changed in each version, newest first.
 
-## Unreleased
+## 0.4.0
 
 ### New
 
