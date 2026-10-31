@@ -23,6 +23,9 @@ mod order;
 #[cfg(any(windows, target_os = "linux"))]
 mod state;
 mod store;
+mod theme;
+#[cfg(windows)]
+mod themetest;
 #[cfg(any(windows, target_os = "linux"))]
 mod ui;
 

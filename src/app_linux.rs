@@ -5,7 +5,7 @@
 use crate::{
     ddc, hotkey_x11,
     state::{self, Cmd, Core},
-    ui,
+    theme, ui,
 };
 use eframe::egui;
 use ksni::blocking::{Handle, TrayMethods};
@@ -383,6 +383,24 @@ fn lock_path() -> PathBuf {
     }
 }
 
+/// New content height `h` (points): resize, and if the window would then reach
+/// below its monitor, move it up by as much in the same frame.
+fn fit_height(ctx: &egui::Context, h: f32) {
+    let (outer, inner, monitor) = ctx.input(|i| {
+        let v = i.viewport();
+        (v.outer_rect, v.inner_rect, v.monitor_size)
+    });
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(ui::WINDOW_W, h)));
+    if let (Some(outer), Some(inner), Some(monitor)) = (outer, inner, monitor) {
+        let grow = h - inner.height();
+        let limit = monitor.y - ui::EDGE as f32;
+        if grow > 0.0 && outer.max.y + grow > limit {
+            let y = (outer.min.y - (outer.max.y + grow - limit)).max(0.0);
+            ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(outer.min.x, y)));
+        }
+    }
+}
+
 // ---- egui app ----
 
 struct BrightnessApp {
@@ -419,6 +437,8 @@ impl BrightnessApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
         VISIBLE.store(true, Ordering::Relaxed);
         self.ui.reset_drag();
+        // Theme panel closed, theme.json read again (the other app may have changed it).
+        self.ui.on_show(ctx);
         self.armed = false; // focus must be seen again before click-away can hide
         ctx.request_repaint();
     }
@@ -514,17 +534,20 @@ impl eframe::App for BrightnessApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        {
+        let height = {
             let mut core = lock(&self.core);
-            ui::draw(ui, &mut core, &mut self.ui);
+            ui::draw(ui, &mut core, &mut self.ui)
+        };
+        if let Some(h) = height {
+            fit_height(ui.ctx(), h);
         }
         if !FIRST_FRAME.swap(true, Ordering::Relaxed) {
             ui.ctx().request_repaint();
         }
     }
 
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        ui::BG.to_normalized_gamma_f32()
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
     }
 }
 
@@ -575,10 +598,13 @@ pub fn run() {
         options,
         Box::new(move |cc| {
             ui::apply_theme(&cc.egui_ctx);
+            let theme_path = std::env::current_exe().ok().and_then(|p| theme::path_in(p.parent()));
+            let ui_state = ui::UiState::new(theme::Store::open(theme_path));
+            ui_state.apply(&cc.egui_ctx);
             let _ = CTX.set(cc.egui_ctx.clone());
             Ok(Box::new(BrightnessApp {
                 core: core.clone(),
-                ui: ui::UiState::default(),
+                ui: ui_state,
                 armed: false,
                 first_hide_done: false,
                 last_focus: None,

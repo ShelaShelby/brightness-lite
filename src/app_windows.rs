@@ -4,7 +4,7 @@
 use crate::{
     ddc,
     state::{self, Cmd, Core},
-    ui,
+    theme, themetest, ui,
 };
 use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -17,6 +17,7 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_CLOAK};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::ProcessStatus::{
     EmptyWorkingSet, GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
@@ -27,11 +28,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetWindowRect, IsWindowVisible,
-    RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW, TranslateMessage,
-    HWND_TOPMOST, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, SPI_GETWORKAREA, SWP_NOSIZE, SW_HIDE, SW_SHOW,
-    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WM_DISPLAYCHANGE, WM_HOTKEY, WM_POWERBROADCAST, WNDCLASSW,
-    WS_POPUP,
+    BringWindowToTop, CreateWindowExW, DefWindowProcW, DispatchMessageW, GetClientRect, GetMessageW, GetWindowRect,
+    IsWindowVisible, RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, SystemParametersInfoW,
+    TranslateMessage, HWND_TOPMOST, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, SPI_GETWORKAREA, SWP_NOACTIVATE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_HIDE, SW_SHOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, WINDOW_EX_STYLE, WM_DISPLAYCHANGE,
+    WM_HOTKEY, WM_POWERBROADCAST, WNDCLASSW, WS_POPUP,
 };
 
 const HOTKEY_UP: i32 = 1;
@@ -216,6 +217,32 @@ fn window_visible() -> bool {
     unsafe { IsWindowVisible(hwnd()) }.as_bool()
 }
 
+/// Give the window a content height of `h` points, moving it in the same
+/// call so it never sticks out of its monitor's work area, not even for one
+/// frame: it grows downward, or upward when it sits at the bottom (see `ui::fit_top`).
+fn fit_height(h: f32, pixels_per_point: f32) {
+    unsafe {
+        let wnd = hwnd();
+        let (mut r, mut client) = (RECT::default(), RECT::default());
+        if GetWindowRect(wnd, &mut r).is_err() || GetClientRect(wnd, &mut client).is_err() {
+            return;
+        }
+        let frame = (r.bottom - r.top) - (client.bottom - client.top);
+        let new_h = (h * pixels_per_point).round() as i32 + frame;
+        if new_h == r.bottom - r.top {
+            return;
+        }
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        let wa = if GetMonitorInfoW(MonitorFromWindow(wnd, MONITOR_DEFAULTTONEAREST), &mut mi).as_bool() {
+            mi.rcWork
+        } else {
+            RECT { top: i32::MIN / 2, bottom: i32::MAX / 2, ..Default::default() }
+        };
+        let top = ui::fit_top(r.top, r.bottom, new_h, wa.top, wa.bottom);
+        let _ = SetWindowPos(wnd, None, r.left, top, r.right - r.left, new_h, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
 fn mouse_button_down() -> bool {
     unsafe { [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON].iter().any(|k| (GetAsyncKeyState(k.0 as i32) as u16) & 0x8000 != 0) }
 }
@@ -284,6 +311,8 @@ impl eframe::App for BrightnessApp {
 
         if JUST_OPENED.swap(false, Ordering::Relaxed) {
             self.ui.reset_drag();
+            // Theme panel closed, theme.json read again (the other app may have changed it).
+            self.ui.on_show(ctx);
             self.armed = false; // focus must be seen again before click-away can hide
         }
 
@@ -315,10 +344,14 @@ impl eframe::App for BrightnessApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        {
+        let height = {
             let mut core = lock(&self.core);
-            ui::draw(ui, &mut core, &mut self.ui);
+            ui::draw(ui, &mut core, &mut self.ui)
+        };
+        if let Some(h) = height {
+            fit_height(h, ui.ctx().pixels_per_point());
         }
+        themetest::frame_done(ui.ctx(), self.ui.hits, self.ui.expanded(), self.ui.theme());
         // Flags for the next logic() call, which runs after this frame is painted.
         let first = !FIRST_FRAME.swap(true, Ordering::Relaxed);
         let shown = AWAIT_FRAME.swap(false, Ordering::Relaxed);
@@ -330,9 +363,14 @@ impl eframe::App for BrightnessApp {
         }
     }
 
-    /// Dark clear colour, so no default white can ever show.
-    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
-        ui::BG.to_normalized_gamma_f32()
+    /// Only for --theme-test: its clicks come in here, as mouse input.
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
+        themetest::hook(ctx, raw_input);
+    }
+
+    /// The theme's background, so no default white (or black) can ever show.
+    fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
+        visuals.panel_fill.to_normalized_gamma_f32()
     }
 }
 
@@ -599,6 +637,9 @@ pub fn run() {
         options,
         Box::new(move |cc| {
             ui::apply_theme(&cc.egui_ctx);
+            let theme_path = std::env::current_exe().ok().and_then(|p| theme::path_in(p.parent()));
+            let ui_state = ui::UiState::new(theme::Store::open(theme_path));
+            ui_state.apply(&cc.egui_ctx);
             let _ = CTX.set(cc.egui_ctx.clone());
             if let Ok(h) = cc.window_handle() {
                 if let RawWindowHandle::Win32(w) = h.as_raw() {
@@ -617,7 +658,24 @@ pub fn run() {
             if let Some(n) = cycle_test {
                 start_cycle_test(n, core.clone());
             }
-            Ok(Box::new(BrightnessApp { core: core.clone(), ui: ui::UiState::default(), armed: false }))
+            if let Some((n, idle)) = themetest::arg() {
+                let path = std::env::current_exe().ok().and_then(|p| theme::path_in(p.parent()));
+                themetest::start(
+                    n,
+                    idle,
+                    path,
+                    themetest::Ops {
+                        ready: || READY.load(Ordering::Relaxed) && SCANNED.load(Ordering::Relaxed),
+                        show: show_window,
+                        hide: hide_window,
+                        hwnd,
+                        repaint,
+                        report,
+                        finish: |code| std::process::exit(code),
+                    },
+                );
+            }
+            Ok(Box::new(BrightnessApp { core: core.clone(), ui: ui_state, armed: false }))
         }),
     );
     if let Err(e) = result {

@@ -89,6 +89,25 @@ pub fn start(notify: fn()) -> Arc<Mutex<Core>> {
 }
 
 impl Core {
+    /// A core with these monitors and no monitor thread, for UI tests.
+    /// Returns the receiving end of its commands.
+    #[cfg(test)]
+    pub fn for_test(views: Vec<crate::cache::View>) -> (Core, std::sync::mpsc::Receiver<Cmd>) {
+        let (tx, rx) = channel();
+        let mut cache = Cache::default();
+        cache.replace(views, 1, Vec::new());
+        let core = Core {
+            cache,
+            settings_path: None,
+            hotkey_error: String::new(),
+            startup_error: String::new(),
+            startup: false,
+            order: Vec::new(),
+            tx,
+        };
+        (core, rx)
+    }
+
     pub fn send(&self, cmd: Cmd) {
         let _ = self.tx.send(cmd);
     }
